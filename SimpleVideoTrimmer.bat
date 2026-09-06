@@ -64,28 +64,82 @@ function Resolve-Tool([string]$name) {
     return $null
 }
 
+# The exact build this app was tested against. Publishers prune old artifacts,
+# so a hard pin WILL 404 eventually - hence pinned first, rolling as a fallback.
+$PinnedVersion = '9.0.1'
+$PinnedSha256  = 'FEC81AE03971D9DD4BE3EBE02E263BD2EC1D789483F931BDBA5F5715E65DA2E9'
+
+# Every ffmpeg switch this app uses (-ss before -i for accurate seeks, -progress,
+# -movflags +faststart, scale/force_original_aspect_ratio, optional -map 0:a:0?)
+# has been stable since 4.0, so that is the floor we enforce.
+$MinFFmpegMajor = 4
+
+function Get-FFmpegVersion([string]$exe) {
+    try { $line = (& $exe -version 2>$null | Select-Object -First 1) } catch { return $null }
+    if (-not $line) { return $null }
+    $m = [regex]::Match([string]$line, 'ffmpeg version n?(\d+)\.(\d+)')
+    if ($m.Success) {
+        return [pscustomobject]@{ Major = [int]$m.Groups[1].Value
+                                  Minor = [int]$m.Groups[2].Value
+                                  Text  = ([string]$line).Trim() }
+    }
+    # git/nightly builds report like "N-12345-gabcdef" - unparseable, assume current
+    return [pscustomobject]@{ Major = 0; Minor = 0; Text = ([string]$line).Trim() }
+}
+
+function Get-RemoteSha256([string]$url) {
+    try {
+        $t = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30).Content
+        $m = [regex]::Match([string]$t, '[0-9a-fA-F]{64}')
+        if ($m.Success) { return $m.Value.ToUpperInvariant() }
+    } catch { }
+    return $null
+}
+
 function Install-FFmpeg {
     $dest = Join-Path $AppDir 'ffmpeg\bin'
-    $tmp  = Join-Path $env:TEMP ('svt_ffmpeg_' + [Guid]::NewGuid().ToString('N'))
     $zip  = Join-Path $env:TEMP 'svt_ffmpeg.zip'
-    $urls = @(
-        'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
-        'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip'
+
+    $sources = @(
+        @{ Name = "pinned $PinnedVersion"
+           Url  = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$PinnedVersion-essentials_build.zip"
+           Sha  = $PinnedSha256; ShaUrl = $null },
+        @{ Name = 'current gyan.dev release'
+           Url  = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+           Sha  = $null; ShaUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256' },
+        @{ Name = 'BtbN build'
+           Url  = 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip'
+           Sha  = $null; ShaUrl = $null }
     )
 
     Write-Host ''
     Write-Step 'ffmpeg was not found on this PC.'
-    Write-Step 'Downloading a portable copy - about 90 MB - into the folder beside this app.'
+    Write-Step "Downloading a portable copy - about 90 MB - into the folder beside this app."
     Write-Step 'This happens once. No admin rights, nothing installed system-wide.'
     Write-Host ''
 
     $got = $false
-    foreach ($url in $urls) {
+    foreach ($src in $sources) {
         try {
-            Write-Step "Fetching $url"
+            Write-Step "Trying the $($src.Name)..."
             if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-            try   { Start-BitsTransfer -Source $url -Destination $zip -Description 'ffmpeg' -ErrorAction Stop }
-            catch { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing }
+            try   { Start-BitsTransfer -Source $src.Url -Destination $zip -Description 'ffmpeg' -ErrorAction Stop }
+            catch { Invoke-WebRequest -Uri $src.Url -OutFile $zip -UseBasicParsing }
+
+            $want = $src.Sha
+            if (-not $want -and $src.ShaUrl) { $want = Get-RemoteSha256 $src.ShaUrl }
+            if ($want) {
+                $have = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToUpperInvariant()
+                if ($have -ne $want) {
+                    Write-Bad "checksum mismatch - discarding this download"
+                    Write-Bad "  expected $want"
+                    Write-Bad "  got      $have"
+                    continue
+                }
+                Write-Step '  checksum verified.'
+            } else {
+                Write-Step '  no published checksum for this source; skipping verification.'
+            }
             $got = $true
             break
         } catch {
@@ -97,6 +151,7 @@ function Install-FFmpeg {
     }
 
     Write-Step 'Unpacking...'
+    $tmp = Join-Path $env:TEMP ('svt_ffmpeg_' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tmp  -Force | Out-Null
     New-Item -ItemType Directory -Path $dest -Force | Out-Null
     Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
@@ -121,7 +176,16 @@ if (-not $FFmpeg -or -not $FFprobe) {
     $FFprobe = Resolve-Tool 'ffprobe'
 }
 if (-not $FFmpeg -or -not $FFprobe) { throw 'ffmpeg is still unavailable after setup.' }
-Write-Ok "ffmpeg:  $FFmpeg"
+
+$ver = Get-FFmpegVersion $FFmpeg
+if (-not $ver) { throw "Found $FFmpeg but it would not run. Delete the ffmpeg folder beside this app and try again." }
+if ($ver.Major -gt 0 -and $ver.Major -lt $MinFFmpegMajor) {
+    Write-Bad "ffmpeg $($ver.Major).$($ver.Minor) is older than $MinFFmpegMajor.0 and may trim inaccurately."
+    Write-Bad 'Remove it from PATH and let this app download its own copy, or upgrade ffmpeg.'
+    Write-Host ''
+}
+$verText = $(if ($ver.Major -gt 0) { "v$($ver.Major).$($ver.Minor)" } else { 'git build' })
+Write-Ok "ffmpeg:  $FFmpeg  ($verText)"
 
 # ------------------------------------------------------------ shared state --
 
@@ -569,21 +633,61 @@ function setChip(text, cls, spinning){
   c.appendChild(document.createTextNode(text));
 }
 
-function canPlayNow(){
-  return mode === "video" ? vOk : (audioState === "ready");
+/* In frames mode the picture never came from the browser decoder, so playback
+   does not depend on audio: run the playhead off a wall clock and refresh
+   stills. When the audio preview lands, hand the clock over to it. */
+var tick = null, tickFrom = 0, tickBase = 0;
+
+function canPlayNow(){ return mode === "video" ? vOk : !!M; }
+
+function playbackIsPlaying(){
+  if (mode === "video") return vOk && !v.paused;
+  return tick !== null || (audioState === "ready" && !au.paused);
 }
+
+function playbackPlay(){
+  if (!canPlayNow()) return;
+  if (PH >= D - 0.02) seek(0);
+  if (mode === "video"){ v.play(); return; }
+  if (audioState === "ready"){
+    try { au.currentTime = PH; } catch (e) {}
+    au.play();
+    return;
+  }
+  tickFrom = PH; tickBase = performance.now();
+  if (tick !== null) clearInterval(tick);
+  tick = setInterval(function(){
+    var t = tickFrom + (performance.now() - tickBase) / 1000;
+    if (selPlay && t >= B){ PH = B; playbackPause(); selPlay = false; renderPlayhead(); showFrame(PH); return; }
+    if (t >= D){ PH = D; playbackPause(); renderPlayhead(); showFrame(PH); return; }
+    PH = t;
+    renderPlayhead();
+    showFrame(PH);
+  }, 100);
+  setPlayIcon(true);
+}
+
+function playbackPause(){
+  if (tick !== null){ clearInterval(tick); tick = null; }
+  try { v.pause(); } catch (e) {}
+  try { au.pause(); } catch (e) {}
+  setPlayIcon(false);
+}
+
 function syncPlayButtons(){
   var on = canPlayNow();
   $("bPlay").disabled = !on;
   $("bSel").disabled  = !on;
-  $("bMute").disabled = !on;
-  $("vol").disabled   = !on;
-  if (!on && mode === "frames"){
-    var tip = audioState === "preparing" ? "Audio is still being prepared"
-            : audioState === "none"      ? "This file has no audio track, so there is nothing to play"
-            : "Audio could not be prepared";
-    $("bPlay").title = tip;
-    $("bSel").title  = tip;
+  /* volume only means something once there is audio to hear */
+  var haveAudio = (mode === "video") ? vOk : (audioState === "ready");
+  $("bMute").disabled = !haveAudio;
+  $("vol").disabled   = !haveAudio;
+  if (mode === "frames" && audioState === "preparing"){
+    $("bPlay").title = "Play / Pause (Space) - silent until the audio preview finishes";
+    $("bSel").title  = "Play the selected range - silent until the audio preview finishes";
+  } else if (mode === "frames" && audioState === "none"){
+    $("bPlay").title = "Play / Pause (Space) - this file has no audio track";
+    $("bSel").title  = "Play only the selected range - this file has no audio track";
   } else {
     $("bPlay").title = "Play / Pause (Space)";
     $("bSel").title  = "Play only the selected range";
@@ -600,7 +704,8 @@ function enterFramesMode(j){
   $("notice").style.display = "flex";
   $("noticeText").textContent =
     "Preview mode - your browser cannot decode this file because " + (j.why || "of an unsupported codec") +
-    ". Frames are rendered on demand as you scrub; trimming and saving always read the original file.";
+    ". Frames are rendered on demand as you scrub. This affects preview only - the video you " +
+    "save is trimmed from the original file, at full quality, with its audio intact.";
   lastFrameAt = -1;
   showFrame(0);
 
@@ -609,7 +714,7 @@ function enterFramesMode(j){
     setChip("No audio track", "off", false);
   } else {
     audioState = "preparing";
-    setChip("Preparing audio...", "work", true);
+    setChip("Preparing audio preview...", "work", true);
     startAudioPrep();
   }
   syncPlayButtons();
@@ -636,7 +741,7 @@ function pollAudio(id, howMode){
       .then(function(r){ return r.json(); })
       .then(function(j){
         if (j.state === "running"){
-          setChip("Preparing audio " + Math.round(j.percent) + "%", "work", true);
+          setChip("Preparing audio preview " + Math.round(j.percent) + "%", "work", true);
           return;
         }
         clearInterval(t);
@@ -649,20 +754,26 @@ function pollAudio(id, howMode){
 
 function audioReady(){
   audioState = "ready";
+  var wasPlaying = (tick !== null);
   au.src = api("/api/audio", "t=" + M.token);
   au.load();
   au.volume = +$("vol").value;
   try { au.currentTime = PH; } catch (e) {}
-  setChip("Audio ready", "done", false);
+  setChip("Audio preview ready", "done", false);
   syncPlayButtons();
-  toast("Audio is ready - you can play this video now.", "good");
+  if (wasPlaying){          /* hand the clock over without interrupting playback */
+    clearInterval(tick); tick = null;
+    try { au.currentTime = PH; } catch (e) {}
+    au.play();
+  }
+  toast("Audio preview is ready - sound is on from here.", "good");
 }
 
 function audioFailed(msg){
   audioState = "failed";
-  setChip("Audio unavailable", "off", false);
+  setChip("Audio preview unavailable", "off", false);
   syncPlayButtons();
-  if (msg) toast("Could not prepare audio: " + msg, "warn");
+  if (msg) toast("Could not prepare the audio preview: " + msg + " (saving is unaffected)", "warn");
 }
 
 /* audio is the clock in frames mode */
@@ -673,15 +784,8 @@ au.addEventListener("timeupdate", function(){
   renderPlayhead();
   showFrame(PH);
 });
-au.addEventListener("play",  function(){
-  $("icPlay").innerHTML = '<path d="M6 5h4v14H6zm8 0h4v14h-4z"/>';
-  $("txPlay").textContent = "Pause";
-});
-au.addEventListener("pause", function(){
-  $("icPlay").innerHTML = '<path d="M8 5v14l11-7z"/>';
-  $("txPlay").textContent = "Play";
-  selPlay = false;
-});
+au.addEventListener("play",  function(){ setPlayIcon(true); });
+au.addEventListener("pause", function(){ if (tick === null) { setPlayIcon(false); selPlay = false; } });
 
 /* --------------------------- timeline input --------------------------- */
 function posToTime(clientX){
@@ -695,6 +799,7 @@ function seek(t){
     if (vOk) { try { v.currentTime = PH; } catch (e) {} }
   } else {
     if (audioState === "ready") { try { au.currentTime = PH; } catch (e) {} }
+    if (tick !== null){ tickFrom = PH; tickBase = performance.now(); }
     showFrame(PH);
   }
   renderPlayhead();
@@ -705,9 +810,8 @@ $("tl").addEventListener("pointerdown", function(e){
   dragging = (e.target === $("hA")) ? "A" : (e.target === $("hB")) ? "B" : "scrub";
   try { $("tl").setPointerCapture(e.pointerId); } catch (err) {}
   if (dragging === "scrub"){
-    var el = (mode === "video") ? v : au;
-    resumeAfterScrub = canPlayNow() && !el.paused;
-    try { el.pause(); } catch (err) {}
+    resumeAfterScrub = playbackIsPlaying();
+    playbackPause();
     selPlay = false;
     seek(posToTime(e.clientX));
   } else {
@@ -726,8 +830,8 @@ $("tl").addEventListener("pointermove", function(e){
 function endDrag(){
   $("hA").classList.remove("drag");
   $("hB").classList.remove("drag");
-  if (dragging === "scrub" && resumeAfterScrub && canPlayNow()){
-    (mode === "video" ? v : au).play();
+  if (dragging === "scrub" && resumeAfterScrub){
+    playbackPlay();
     resumeAfterScrub = false;
   }
   dragging = null;
@@ -751,19 +855,15 @@ function showPop(clientX){
 /* ----------------------------- transport ------------------------------ */
 function togglePlay(){
   if (!M || !canPlayNow()) return;
-  var el = (mode === "video") ? v : au;
-  if (el.paused){ if (PH >= D - 0.02) seek(0); el.play(); }
-  else el.pause();
+  if (playbackIsPlaying()) playbackPause(); else playbackPlay();
 }
-v.addEventListener("play", function(){
-  $("icPlay").innerHTML = '<path d="M6 5h4v14H6zm8 0h4v14h-4z"/>';
-  $("txPlay").textContent = "Pause";
-});
-v.addEventListener("pause", function(){
-  $("icPlay").innerHTML = '<path d="M8 5v14l11-7z"/>';
-  $("txPlay").textContent = "Play";
-  selPlay = false;
-});
+function setPlayIcon(on){
+  $("icPlay").innerHTML = on ? '<path d="M6 5h4v14H6zm8 0h4v14h-4z"/>'
+                             : '<path d="M8 5v14l11-7z"/>';
+  $("txPlay").textContent = on ? "Pause" : "Play";
+}
+v.addEventListener("play",  function(){ setPlayIcon(true); });
+v.addEventListener("pause", function(){ setPlayIcon(false); selPlay = false; });
 v.addEventListener("timeupdate", function(){
   PH = v.currentTime;
   if (selPlay && PH >= B){ v.pause(); seek(B); selPlay = false; }
@@ -779,7 +879,7 @@ v.addEventListener("error", function(){
 
 function step(dir, big){
   if (!M) return;
-  try { v.pause(); au.pause(); } catch (e) {}
+  playbackPause();
   seek(PH + dir * (big ? 1 : 1 / (M.fps || 25)));
 }
 
@@ -792,7 +892,7 @@ $("bNext").onclick = function(e){ step(1, e.shiftKey); };
 $("bSel").onclick = function(){
   if (!M || !canPlayNow()) return;
   seek(A); selPlay = true;
-  (mode === "video" ? v : au).play();
+  playbackPlay();
 };
 $("bMute").onclick = function(){
   v.muted = !v.muted;
@@ -807,8 +907,8 @@ $("vol").oninput = function(e){
 };
 $("bSetA").onclick = function(){ setA(PH); };
 $("bSetB").onclick = function(){ setB(PH); };
-$("bGoA").onclick  = function(){ try { v.pause(); au.pause(); } catch (e) {} seek(A); };
-$("bGoB").onclick  = function(){ try { v.pause(); au.pause(); } catch (e) {} seek(B); };
+$("bGoA").onclick  = function(){ playbackPause(); seek(A); };
+$("bGoB").onclick  = function(){ playbackPause(); seek(B); };
 $("bReset").onclick = function(){ A = 0; B = D; render(); toast("Selection reset to the whole video."); };
 
 function commit(which){
