@@ -365,12 +365,10 @@ $S.Html = @'
   <div class="notice" id="notice">
     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 1 21h22L12 2zm1 14h-2v2h2v-2zm0-7h-2v5h2V9z"/></svg>
     <span class="txt" id="noticeText"></span>
-    <span class="chip" id="audioChip"></span>
   </div>
 
   <div class="stage">
     <video id="v" preload="auto"></video>
-    <audio id="au" preload="auto"></audio>
     <div class="empty" id="empty">
       <svg viewBox="0 0 24 24"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V4h-4z"/></svg>
       <h2>No video loaded</h2>
@@ -447,9 +445,8 @@ var A = 0, B = 0, D = 0; // start, end, duration
 var PH = 0;              // playhead, kept independent of <video> so the timeline
                          // still works on files the browser cannot decode
 var vOk = false;         // is the <video> element actually usable?
-var mode = "video";      // "video" = browser decodes it | "frames" = server-rendered stills
-var audioState = "none"; // none | preparing | ready | failed
-var au = $("au");
+var mode = "video";      // "video" = browser decodes it | "frames" = live-remuxed stream
+var playStart = 0;       // offset the preview stream was started at
 var dragging = null;     // "A" | "B" | "scrub"
 var resumeAfterScrub = false;
 var selPlay = false;
@@ -565,9 +562,8 @@ function loadMedia(j){
 
   $("empty").style.display = "none";
   PH = 0;
-  try { au.pause(); } catch (e) {}
-  au.removeAttribute("src");
-  audioState = "none";
+  playStart = 0;
+  stopStream();
   if (j.playable){
     mode = "video";
     vOk = true;
@@ -631,72 +627,89 @@ function showFrame(t){
   pre.src = url;
 }
 
-function setChip(text, cls, spinning){
-  var c = $("audioChip");
-  c.className = "chip " + (cls || "");
-  c.innerHTML = (spinning ? '<span class="spin"></span>' : "") + "";
-  c.appendChild(document.createTextNode(text));
+/* Preview mode used to animate server-rendered stills, which capped out near
+   6fps because every frame was its own ffmpeg process. Playback now streams a
+   live-remuxed fragmented MP4 into the same <video> element, so the browser
+   decodes it natively. Stills are still used for scrubbing and frame stepping,
+   where exactness matters more than smoothness. */
+
+function canPlayNow(){ return !!M && (mode === "video" ? vOk : true); }
+
+function playbackIsPlaying(){ return !!M && !v.paused && v.style.display !== "none"; }
+
+function stopStream(){
+  try { v.pause(); } catch (e) {}
+  v.removeAttribute("src");
+  try { v.load(); } catch (e) {}   /* aborts the request, which kills ffmpeg */
 }
 
-/* In frames mode the picture never came from the browser decoder, so playback
-   does not depend on audio: run the playhead off a wall clock and refresh
-   stills. When the audio preview lands, hand the clock over to it. */
-var tick = null, tickFrom = 0, tickBase = 0;
-
-function canPlayNow(){ return mode === "video" ? vOk : !!M; }
-
-function playbackIsPlaying(){
-  if (mode === "video") return vOk && !v.paused;
-  return tick !== null || (audioState === "ready" && !au.paused);
+/* play() can be refused - autoplay policy, or Chrome pausing silent video in a
+   background tab - so never leave the button claiming to be playing. */
+function guardPlay(){
+  var pr = v.play();
+  if (pr && pr.catch) pr.catch(function(){
+    playbackPause();
+    toast((M && !M.hasAudio)
+      ? "The browser blocked playback of a silent video. Click the page, or bring this tab to the front."
+      : "The browser blocked playback. Click the page and try again.", "warn");
+  });
 }
 
 function playbackPlay(){
   if (!canPlayNow()) return;
-  if (PH >= D - 0.02) seek(0);
-  if (mode === "video"){ v.play(); return; }
-  if (audioState === "ready"){
-    try { au.currentTime = PH; } catch (e) {}
-    au.play();
-    return;
-  }
-  tickFrom = PH; tickBase = performance.now();
-  if (tick !== null) clearInterval(tick);
-  tick = setInterval(function(){
-    var t = tickFrom + (performance.now() - tickBase) / 1000;
-    if (selPlay && t >= B){ PH = B; playbackPause(); selPlay = false; renderPlayhead(); showFrame(PH); return; }
-    if (t >= D){ PH = D; playbackPause(); renderPlayhead(); showFrame(PH); return; }
-    PH = t;
-    renderPlayhead();
-    showFrame(PH);
-  }, 100);
+  if (PH >= D - 0.05) seek(0);
+  if (mode === "video"){ guardPlay(); return; }
+
+  var want = PH;
+  playStart = want;                /* corrected below once the real start is known */
+  $("frame").style.display = "none";
+  v.style.display = "block";
+  v.src = api("/api/play", "t=" + M.token + "&start=" + want.toFixed(6));
+  v.load();
+  guardPlay();
   setPlayIcon(true);
+
+  /* a stream copy can only begin on a keyframe, so ask where it really starts;
+     runs alongside the stream so play is not held up waiting for it */
+  fetch(api("/api/playinfo", "t=" + M.token + "&at=" + want.toFixed(6)))
+    .then(function(r){ return r.json(); })
+    .then(function(j){ if (j && j.ok && isFinite(j.start)) playStart = j.start; })
+    .catch(function(){ });
+}
+
+/* Tearing the stream down fires timeupdate with currentTime 0, so the playhead
+   has to be carried across by hand or it snaps back to the stream's start. */
+function exitStreamToStill(){
+  var at = PH;
+  stopStream();
+  v.style.display = "none";
+  $("frame").style.display = "block";
+  PH = at;
+  lastFrameAt = -1;
+  showFrame(at);
+  setPlayIcon(false);
 }
 
 function playbackPause(){
-  if (tick !== null){ clearInterval(tick); tick = null; }
-  try { v.pause(); } catch (e) {}
-  try { au.pause(); } catch (e) {}
-  setPlayIcon(false);
+  if (mode === "video"){
+    try { v.pause(); } catch (e) {}
+    setPlayIcon(false);
+    return;
+  }
+  exitStreamToStill();
 }
 
 function syncPlayButtons(){
   var on = canPlayNow();
   $("bPlay").disabled = !on;
   $("bSel").disabled  = !on;
-  /* volume only means something once there is audio to hear */
-  var haveAudio = (mode === "video") ? vOk : (audioState === "ready");
+  var haveAudio = on && (!M || M.hasAudio);
   $("bMute").disabled = !haveAudio;
   $("vol").disabled   = !haveAudio;
-  if (mode === "frames" && audioState === "preparing"){
-    $("bPlay").title = "Play / Pause (Space) - silent until the audio preview finishes";
-    $("bSel").title  = "Play the selected range - silent until the audio preview finishes";
-  } else if (mode === "frames" && audioState === "none"){
-    $("bPlay").title = "Play / Pause (Space) - this file has no audio track";
-    $("bSel").title  = "Play only the selected range - this file has no audio track";
-  } else {
-    $("bPlay").title = "Play / Pause (Space)";
-    $("bSel").title  = "Play only the selected range";
-  }
+  $("bPlay").title = "Play / Pause (Space)";
+  $("bSel").title  = (M && !M.hasAudio)
+    ? "Play only the selected range - this file has no audio track"
+    : "Play only the selected range";
 }
 
 function enterFramesMode(j){
@@ -708,89 +721,13 @@ function enterFramesMode(j){
   $("frame").style.display = "block";
   $("notice").style.display = "flex";
   $("noticeText").textContent =
-    "Preview mode - your browser cannot decode this file because " + (j.why || "of an unsupported codec") +
-    ". Frames are rendered on demand as you scrub. This affects preview only - the video you " +
-    "save is trimmed from the original file, at full quality, with its audio intact.";
+    "Preview mode - your browser cannot decode this file directly because " + (j.why || "of an unsupported codec") +
+    ", so it is converted on the fly as you play. This affects preview only - the video you " +
+    "save is trimmed from the original file, at full quality.";
   lastFrameAt = -1;
   showFrame(0);
-
-  if (j.audioMode === "none"){
-    audioState = "none";
-    setChip("No audio track", "off", false);
-  } else {
-    audioState = "preparing";
-    setChip("Preparing audio preview...", "work", true);
-    startAudioPrep();
-  }
   syncPlayButtons();
 }
-
-/* Runs by itself in the background - nothing here blocks scrubbing or trimming. */
-function startAudioPrep(){
-  fetch(api("/api/prep", "t=" + M.token), { method: "POST" })
-    .then(function(r){ return r.json(); })
-    .then(function(j){
-      if (!j.ok){ audioFailed(j.error); return; }
-      if (j.silent){ audioState = "none"; setChip("No audio track", "off", false); syncPlayButtons(); return; }
-      if (j.ready){ audioReady(); return; }
-      pollAudio(j.job, j.mode);
-    })
-    .catch(function(e){ audioFailed(e.message); });
-}
-
-function pollAudio(id, howMode){
-  var token = M.token;
-  var t = setInterval(function(){
-    if (!M || M.token !== token){ clearInterval(t); return; }   /* user opened another file */
-    fetch(api("/api/job", "id=" + id))
-      .then(function(r){ return r.json(); })
-      .then(function(j){
-        if (j.state === "running"){
-          setChip("Preparing audio preview " + Math.round(j.percent) + "%", "work", true);
-          return;
-        }
-        clearInterval(t);
-        if (j.state === "done") audioReady();
-        else audioFailed(j.error);
-      })
-      .catch(function(){ });
-  }, 700);
-}
-
-function audioReady(){
-  audioState = "ready";
-  var wasPlaying = (tick !== null);
-  au.src = api("/api/audio", "t=" + M.token);
-  au.load();
-  au.volume = +$("vol").value;
-  try { au.currentTime = PH; } catch (e) {}
-  setChip("Audio preview ready", "done", false);
-  syncPlayButtons();
-  if (wasPlaying){          /* hand the clock over without interrupting playback */
-    clearInterval(tick); tick = null;
-    try { au.currentTime = PH; } catch (e) {}
-    au.play();
-  }
-  toast("Audio preview is ready - sound is on from here.", "good");
-}
-
-function audioFailed(msg){
-  audioState = "failed";
-  setChip("Audio preview unavailable", "off", false);
-  syncPlayButtons();
-  if (msg) toast("Could not prepare the audio preview: " + msg + " (saving is unaffected)", "warn");
-}
-
-/* audio is the clock in frames mode */
-au.addEventListener("timeupdate", function(){
-  if (mode !== "frames") return;
-  PH = au.currentTime;
-  if (selPlay && PH >= B){ au.pause(); seek(B); selPlay = false; }
-  renderPlayhead();
-  showFrame(PH);
-});
-au.addEventListener("play",  function(){ setPlayIcon(true); });
-au.addEventListener("pause", function(){ if (tick === null) { setPlayIcon(false); selPlay = false; } });
 
 /* --------------------------- timeline input --------------------------- */
 function posToTime(clientX){
@@ -803,9 +740,8 @@ function seek(t){
   if (mode === "video"){
     if (vOk) { try { v.currentTime = PH; } catch (e) {} }
   } else {
-    if (audioState === "ready") { try { au.currentTime = PH; } catch (e) {} }
-    if (tick !== null){ tickFrom = PH; tickBase = performance.now(); }
-    showFrame(PH);
+    if (playbackIsPlaying()) exitStreamToStill();
+    else showFrame(PH);
   }
   renderPlayhead();
 }
@@ -870,17 +806,23 @@ function setPlayIcon(on){
 v.addEventListener("play",  function(){ setPlayIcon(true); });
 v.addEventListener("pause", function(){ setPlayIcon(false); selPlay = false; });
 v.addEventListener("timeupdate", function(){
-  PH = v.currentTime;
-  if (selPlay && PH >= B){ v.pause(); seek(B); selPlay = false; }
+  if (mode === "frames" && !playbackIsPlaying()) return;
+  PH = (mode === "video") ? v.currentTime : (playStart + v.currentTime);
+  if (selPlay && PH >= B){ playbackPause(); selPlay = false; seek(B); }
   renderPlayhead();
 });
-v.addEventListener("seeked", function(){ PH = v.currentTime; renderPlayhead(); });
+v.addEventListener("seeked", function(){
+  if (mode === "video"){ PH = v.currentTime; renderPlayhead(); }
+});
 v.addEventListener("loadedmetadata", function(){
   if (M && (!D || !isFinite(D)) && isFinite(v.duration)){ D = v.duration; B = D; render(); }
 });
 v.addEventListener("error", function(){
-  if (M && mode === "video"){ enterFramesMode(M); }
+  if (!M) return;
+  if (mode === "video"){ enterFramesMode(M); }
+  else if (playbackIsPlaying()) { playbackPause(); toast("Preview stream stopped.", "warn"); }
 });
+v.addEventListener("ended", function(){ if (mode === "frames") playbackPause(); });
 
 function step(dir, big){
   if (!M) return;
@@ -909,15 +851,11 @@ $("bSel").onclick = function(){
 };
 $("bMute").onclick = function(){
   v.muted = !v.muted;
-  au.muted = v.muted;
   $("icVol").innerHTML = v.muted
     ? '<path d="M3 9v6h4l5 5V4L7 9H3zm18.6 1.4L20.2 9l-2.1 2.1L16 9l-1.4 1.4 2.1 2.1-2.1 2.1L16 16l2.1-2.1L20.2 16l1.4-1.4-2.1-2.1z"/>'
     : '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/>';
 };
-$("vol").oninput = function(e){
-  v.volume = +e.target.value; au.volume = +e.target.value;
-  v.muted = false; au.muted = false;
-};
+$("vol").oninput = function(e){ v.volume = +e.target.value; v.muted = false; };
 $("bSetA").onclick = function(){ setA(PH); };
 $("bSetB").onclick = function(){ setB(PH); };
 $("bGoA").onclick  = function(){ playbackPause(); seek(A); };
@@ -1149,15 +1087,6 @@ function Get-StripPath([string]$path) {
     Join-Path $S.CacheDir "strip_$h.jpg"
 }
 
-function Get-AudioPath([string]$path) {
-    $fi  = Get-Item -LiteralPath $path
-    $sig = 'aud|{0}|{1}|{2}' -f $fi.FullName, $fi.Length, $fi.LastWriteTimeUtc.Ticks
-    $md5 = [Security.Cryptography.MD5]::Create()
-    try   { $h = ($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($sig)) | ForEach-Object { $_.ToString('x2') }) -join '' }
-    finally { $md5.Dispose() }
-    Join-Path $S.CacheDir "aud_$h.m4a"
-}
-
 # One still frame taken straight from the source. Roughly 100 ms even on a 4 GB
 # file, which is what lets an undecodable video be scrubbed without copying any
 # video data at all.
@@ -1224,6 +1153,32 @@ function Get-StepTime([object]$info, [double]$at, [int]$dir) {
 
     if ($null -eq $cand) { $cand = $at + ($dir * $span) }
     return [math]::Max(0.0, [math]::Min($dur, [double]$cand))
+}
+
+# -ss with -c:v copy can only start on a keyframe, so the caller needs to know
+# where the stream will actually begin or the playhead would disagree with the
+# picture. -copyts is required here or showinfo reports times relative to the seek.
+function Get-KeyframeTime([object]$info, [double]$at) {
+    foreach ($win in @(4.0, 30.0)) {
+        $from = [math]::Max(0.0, $at - $win)
+        $out  = & $S.FFmpeg -hide_banner -v info -copyts -skip_frame nokey `
+                            -ss (Num $from '0.######') -i $info.path -frames:v 60 `
+                            -vf showinfo -an -sn -f null - 2>&1
+        $best = $null
+        foreach ($line in @($out)) {
+            foreach ($m in [regex]::Matches([string]$line, 'pts_time:([0-9]+\.?[0-9]*)')) {
+                $d = 0.0
+                if ([double]::TryParse($m.Groups[1].Value, [Globalization.NumberStyles]::Float, $inv, [ref]$d)) {
+                    if ($d -le ($at + 0.0005)) {
+                        if (($null -eq $best) -or ($d -gt $best)) { $best = $d }
+                    }
+                }
+            }
+        }
+        if ($null -ne $best) { return [double]$best }
+        if ($from -le 0.0) { break }
+    }
+    return [math]::Max(0.0, $at)
 }
 
 # Build one wide sprite of evenly spaced thumbnails by seeking - stays fast on long videos.
@@ -1409,54 +1364,62 @@ try {
             break
         }
 
-        '^/api/audio$' {
-            $ap = $S.Audio[[string]$q['t']]
-            if (-not $ap -or -not (Test-Path -LiteralPath $ap)) { Send-Text 'No audio prepared' 'text/plain' 404; break }
-            Send-FileRange $ap
+        '^/api/playinfo$' {
+            $info = $S.Files[[string]$q['t']]
+            if (-not $info) { Send-Json @{ ok = $false }; break }
+            $at = 0.0
+            [void][double]::TryParse([string]$q['at'], [Globalization.NumberStyles]::Float, $inv, [ref]$at)
+            $at = [math]::Max(0.0, [math]::Min([double]$info.duration, $at))
+            # a re-encode can start exactly where asked; a stream copy cannot
+            $start = $(if ($info.vOk) { Get-KeyframeTime $info $at } else { $at })
+            Send-Json @{ ok = $true; start = $start }
             break
         }
 
-        '^/api/prep$' {
-            $tok  = [string]$q['t']
-            $info = $S.Files[$tok]
-            if (-not $info) { Send-Json @{ ok = $false; error = 'That video is no longer loaded.' }; break }
-            if ($info.audioMode -eq 'none') { Send-Json @{ ok = $true; ready = $true; silent = $true }; break }
+        '^/api/play$' {
+            $info = $S.Files[[string]$q['t']]
+            if (-not $info) { Send-Text 'Unknown token' 'text/plain' 404; break }
+            $at = 0.0
+            [void][double]::TryParse([string]$q['start'], [Globalization.NumberStyles]::Float, $inv, [ref]$at)
+            $at = [math]::Max(0.0, [math]::Min([double]$info.duration, $at))
 
-            # Audio only - the video is never copied, so this costs tens of MB
-            # instead of the gigabytes a full remux would have needed.
-            $dest = Get-AudioPath $info.path
-            if (Test-Path -LiteralPath $dest) {
-                $S.Audio[$tok] = $dest
-                Send-Json @{ ok = $true; ready = $true }
-                break
-            }
+            # Remux live into the response: copy the picture when the browser can
+            # decode it, re-encode only what it cannot. Nothing is written to disk.
+            $vArgs = $(if ($info.vOk) { @('-c:v', 'copy') }
+                       else { @('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p') })
+            $aArgs = $(if (-not $info.hasAudio) { @('-an') }
+                       elseif ($info.aOk) { @('-c:a', 'copy') }
+                       else { @('-c:a', 'aac', '-b:a', '160k') })
+            $ffArgs = @('-hide_banner', '-v', 'error', '-ss', (Num $at '0.######'), '-i', $info.path) +
+                      $vArgs + $aArgs +
+                      @('-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1')
 
-            $id   = [Guid]::NewGuid().ToString('N')
-            $prog = Join-Path $S.CacheDir "prog_$id.txt"
-            $log  = Join-Path $S.CacheDir "log_$id.txt"
-            $aArgs = $(if ($info.audioMode -eq 'copy') { @('-c:a', 'copy') } else { @('-c:a', 'aac', '-b:a', '160k') })
-            $ffArgs = @(
-                '-y', '-hide_banner', '-nostats',
-                '-progress', ('"' + $prog + '"'),
-                '-i', ('"' + $info.path + '"'),
-                '-vn', '-sn', '-map', '0:a:0'
-            ) + $aArgs + @('-movflags', '+faststart', ('"' + $dest + '"'))
-
-            $cmdLine = '"{0}" {1} 2>"{2}"' -f $S.FFmpeg, ($ffArgs -join ' '), $log
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName        = $env:ComSpec
-            $psi.Arguments       = '/c "' + $cmdLine + '"'
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow  = $true
-            $proc = New-Object System.Diagnostics.Process
-            $proc.StartInfo = $psi
-            [void]$proc.Start()
-            $S.Jobs[$id] = @{
-                state = 'running'; percent = 0.0; proc = $proc; prog = $prog; log = $log
-                out = $dest; outName = [IO.Path]::GetFileName($dest); span = [double]$info.duration
-                error = ''; kind = 'prep'; token = $tok
+            $psi.FileName = $S.FFmpeg
+            # PowerShell 5.1 has no ArgumentList, so quote by hand
+            $psi.Arguments = (($ffArgs | ForEach-Object {
+                if ($_ -match '[\s"]') { '"' + $_ + '"' } else { $_ }
+            }) -join ' ')
+            $psi.UseShellExecute        = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.CreateNoWindow         = $true
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            # stderr must be drained or a full pipe buffer would stall ffmpeg
+            $null = $proc.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+
+            $res.ContentType = 'video/mp4'
+            $res.SendChunked = $true
+            $res.Headers['Cache-Control'] = 'no-store'
+            try {
+                $proc.StandardOutput.BaseStream.CopyTo($res.OutputStream, 65536)
+            } catch {
+                # the browser seeked or paused - that closes the socket, which is normal
+            } finally {
+                try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+                try { $proc.Dispose() } catch { }
             }
-            Send-Json @{ ok = $true; job = $id; mode = $info.audioMode }
             break
         }
 
@@ -1554,9 +1517,7 @@ try {
                     if ($null -eq $code) { $code = -1 }
                     if ($code -eq 0 -and (Test-Path -LiteralPath $job.out)) {
                         $job.state = 'done'; $job.percent = 100.0
-                        if ($job.kind -eq 'prep') { $S.Audio[$job.token] = $job.out }
                     } else {
-                        if ($job.kind -eq 'prep') { Remove-Item -LiteralPath $job.out -Force -ErrorAction SilentlyContinue }
                         $tail = ''
                         try {
                             $lines = Get-Content -LiteralPath $job.log -ErrorAction SilentlyContinue |
@@ -1622,7 +1583,7 @@ if ($port -eq 0) { throw 'Could not open a local port between 8731 and 8780.' }
 $S.Listener = $listener
 
 $iss  = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-$pool = [runspacefactory]::CreateRunspacePool(1, 8, $iss, $Host)
+$pool = [runspacefactory]::CreateRunspacePool(1, 16, $iss, $Host)
 $pool.ApartmentState = 'STA'
 $pool.Open()
 
@@ -1666,7 +1627,6 @@ try {
     try { $pool.Close(); $pool.Dispose() } catch { }
     Get-ChildItem -LiteralPath $S.CacheDir -Filter 'prog_*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $S.CacheDir -Filter 'log_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath $S.CacheDir -Filter 'aud_*.m4a'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $S.CacheDir -Filter 'frame_*.jpg' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Write-Ok 'Goodbye.'
     Start-Sleep -Milliseconds 600
