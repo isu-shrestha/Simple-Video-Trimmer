@@ -616,10 +616,10 @@ var frameBusy = false, framePending = null, lastFrameAt = -1;
 function showFrame(t){
   if (mode !== "frames" || !M) return;
   var at = clamp(t, 0, D);
-  if (Math.abs(at - lastFrameAt) < 0.01 && lastFrameAt >= 0) return;
+  if (Math.abs(at - lastFrameAt) < 0.0005 && lastFrameAt >= 0) return;
   if (frameBusy){ framePending = at; return; }
   frameBusy = true;
-  var url = api("/api/frame", "t=" + M.token + "&at=" + at.toFixed(2));
+  var url = api("/api/frame", "t=" + M.token + "&at=" + at.toFixed(6));
   var pre = new Image();
   pre.onload = function(){
     lastFrameAt = at;
@@ -885,7 +885,15 @@ v.addEventListener("error", function(){
 function step(dir, big){
   if (!M) return;
   playbackPause();
-  seek(PH + dir * (big ? 1 : 1 / (M.fps || 25)));
+  if (big){ seek(PH + dir); return; }
+  /* ask for the real timestamp of the neighbouring frame rather than
+     assuming frames sit on exact 1/fps boundaries */
+  var from = PH;
+  var fallback = function(){ seek(from + dir / (M.fps || 25)); };
+  fetch(api("/api/step", "t=" + M.token + "&at=" + from.toFixed(6) + "&dir=" + dir))
+    .then(function(r){ return r.json(); })
+    .then(function(j){ if (j && j.ok && isFinite(j.t)) seek(j.t); else fallback(); })
+    .catch(fallback);
 }
 
 /* ------------------------------- wiring ------------------------------- */
@@ -1156,10 +1164,66 @@ function Get-AudioPath([string]$path) {
 function Get-Frame([object]$info, [double]$at) {
     $fw = [math]::Min(960, [int]$info.width)
     if ($fw -lt 16) { $fw = 960 }
-    $dst = Join-Path $S.CacheDir ('frame_' + [Guid]::NewGuid().ToString('N') + '.jpg')
-    $t   = [math]::Max(0, [math]::Min(([double]$info.duration - 0.04), $at))
-    & $S.FFmpeg -y -v error -ss (Num $t '0.###') -i $info.path -frames:v 1 -vf "scale=${fw}:-2" -an -sn -q:v 4 $dst 2>&1 | Out-Null
+    $fps = [double]$info.fps
+    if ($fps -le 0) { $fps = 25.0 }
+
+    # -ss returns the first frame at OR AFTER the seek point, so aim a quarter
+    # of a frame early. That absorbs the rounding in a timestamp that has been
+    # round-tripped as text, without ever reaching back into the frame before.
+    $back = 0.25 / $fps
+    $dst  = Join-Path $S.CacheDir ('frame_' + [Guid]::NewGuid().ToString('N') + '.jpg')
+    $t    = [math]::Max(0.0, [math]::Min(([double]$info.duration - 0.04), $at - $back))
+    & $S.FFmpeg -y -v error -ss (Num $t '0.######') -i $info.path -frames:v 1 -vf "scale=${fw}:-2" -an -sn -q:v 4 $dst 2>&1 | Out-Null
     return $dst
+}
+
+# The real presentation timestamps of the neighbouring frames.
+#
+# Stepping by 1/fps cannot work: at 60fps a frame is 16.667ms, and rounding that
+# to any fixed number of decimals eventually lands past a frame boundary, which
+# is what made "next frame" show the same picture twice.
+#
+# ffprobe -read_intervals is not usable here - it honours the duration but
+# ignores the start, so it always reads from 0 - hence ffmpeg + showinfo, which
+# reports the true pts of each decoded frame.
+function Get-FrameTimes([object]$info, [double]$from, [int]$count) {
+    $out = & $S.FFmpeg -hide_banner -v info -copyts -ss (Num $from '0.######') `
+                       -i $info.path -frames:v $count -vf showinfo -an -sn -f null - 2>&1
+    $times = New-Object System.Collections.Generic.List[double]
+    foreach ($line in @($out)) {
+        foreach ($m in [regex]::Matches([string]$line, 'pts_time:([0-9]+\.?[0-9]*)')) {
+            $d = 0.0
+            if ([double]::TryParse($m.Groups[1].Value, [Globalization.NumberStyles]::Float, $inv, [ref]$d)) {
+                $times.Add($d)
+            }
+        }
+    }
+    $times.Sort()
+    return $times
+}
+
+function Get-StepTime([object]$info, [double]$at, [int]$dir) {
+    $dur = [double]$info.duration
+    $fps = [double]$info.fps
+    if ($fps -le 0) { $fps = 25.0 }
+    $span = 1.0 / $fps
+    $eps  = 0.4 * $span
+
+    if ($dir -ge 0) {
+        $from  = [math]::Max(0.0, $at - (0.25 * $span))
+        $count = 3
+    } else {
+        $from  = [math]::Max(0.0, $at - 0.5)
+        $count = [int][math]::Min(240, [math]::Ceiling(0.5 * $fps) + 4)
+    }
+
+    $times = Get-FrameTimes $info $from $count
+    $cand  = $null
+    if ($dir -ge 0) { foreach ($x in $times) { if ($x -gt ($at + $eps)) { $cand = $x; break } } }
+    else            { foreach ($x in $times) { if ($x -lt ($at - $eps)) { $cand = $x } } }
+
+    if ($null -eq $cand) { $cand = $at + ($dir * $span) }
+    return [math]::Max(0.0, [math]::Min($dur, [double]$cand))
 }
 
 # Build one wide sprite of evenly spaced thumbnails by seeking - stays fast on long videos.
@@ -1172,7 +1236,7 @@ function New-Strip([string]$path, [double]$dur, [string]$out) {
     $vf = "scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black"
     try {
         for ($i = 0; $i -lt $n; $i++) {
-            $t   = [math]::Max(0, [math]::Min($dur - 0.05, ($i + 0.5) * $dur / $n))
+            $t   = [math]::Max(0.0, [math]::Min($dur - 0.05, ($i + 0.5) * $dur / $n))
             $dst = Join-Path $work ('{0:d3}.jpg' -f $i)
             & $S.FFmpeg -y -v error -ss (Num $t '0.###') -i $path -frames:v 1 -vf $vf -an -sn -q:v 5 $dst 2>&1 | Out-Null
         }
@@ -1332,6 +1396,16 @@ try {
                 $res.Headers['Cache-Control'] = 'max-age=3600'
                 Send-Bytes ([IO.File]::ReadAllBytes($f)) 'image/jpeg'
             } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+            break
+        }
+
+        '^/api/step$' {
+            $info = $S.Files[[string]$q['t']]
+            if (-not $info) { Send-Json @{ ok = $false }; break }
+            $at = 0.0
+            [void][double]::TryParse([string]$q['at'], [Globalization.NumberStyles]::Float, $inv, [ref]$at)
+            $dir = $(if ([string]$q['dir'] -eq '-1') { -1 } else { 1 })
+            Send-Json @{ ok = $true; t = (Get-StepTime $info $at $dir) }
             break
         }
 
