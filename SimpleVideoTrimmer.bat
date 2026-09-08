@@ -322,8 +322,14 @@ $S.Html = @'
   .mark.b{color:#ffc186;border-color:#69492a}
   .mark.a:hover:not(:disabled){background:#1b2c3f;border-color:#3f6d9e}
   .mark.b:hover:not(:disabled){background:#33261a;border-color:#8a5f2e}
-  .jump{color:var(--dim);background:transparent}
-  .jump:hover:not(:disabled){color:var(--text)}
+  /* the START label is itself the "jump there" control */
+  .labbtn{font-size:12px;text-transform:uppercase;letter-spacing:.6px;font-weight:600;
+    background:transparent;border:1px solid transparent;padding:6px 8px;gap:5px}
+  .labbtn svg{width:13px;height:13px;opacity:.55}
+  .labbtn.a{color:#63b3ff}
+  .labbtn:hover:not(:disabled){background:#1b2c3f;border-color:#2f4a68}
+  .labbtn:hover:not(:disabled) svg{opacity:1}
+  .sep{width:1px;height:22px;background:var(--line);margin:0 2px}
   .len{margin-left:auto;display:flex;align-items:center;gap:10px}
   .len .box{font:13px/1 "Consolas",monospace;background:#0b0f14;border:1px solid var(--line);
     border-radius:6px;padding:8px 11px;color:var(--dim);white-space:nowrap}
@@ -376,7 +382,10 @@ $S.Html = @'
 
   <div class="panel">
     <div class="transport">
+      <button id="bSetA" class="mark a" disabled title="Move the START point to the scrubber  (shortcut: I)"><svg viewBox="0 0 24 24"><path d="M11 4h2v9h3.5L12 18l-4.5-5H11z" /><path d="M5 20h14v2H5z"/></svg>Set Start</button>
       <button id="bPlay" disabled title="Play / Pause (Space)"><svg id="icPlay" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg><span id="txPlay">Play</span></button>
+      <button id="bSetB" class="mark b" disabled title="Move the END point to the scrubber  (shortcut: O)"><svg viewBox="0 0 24 24"><path d="M11 4h2v9h3.5L12 18l-4.5-5H11z" /><path d="M5 20h14v2H5z"/></svg>Set End</button>
+      <span class="sep"></span>
       <button id="bPrev" class="iconbtn" disabled title="Previous frame (Left arrow)"><svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm12 0v12l-9-6z"/></svg></button>
       <button id="bNext" class="iconbtn" disabled title="Next frame (Right arrow)"><svg viewBox="0 0 24 24"><path d="M16 6h2v12h-2zM6 6l9 6-9 6z"/></svg></button>
       <button id="bSel" disabled title="Play only the selected range"><svg viewBox="0 0 24 24"><path d="M4 5v14l8-7zm9 0v14l8-7z"/></svg>Play Selection</button>
@@ -402,16 +411,12 @@ $S.Html = @'
 
     <div class="trim">
       <div class="grp">
-        <span class="lab a">Start</span>
+        <button id="bGoA" class="labbtn a" disabled title="Jump the scrubber to the start point">START<svg viewBox="0 0 24 24"><path d="M4 11h9V7.5L18 12l-5 4.5V13H4z"/></svg></button>
         <input type="text" id="inA" value="00:00:00.000" disabled title="Type a time, e.g. 1:23.500">
-        <button id="bSetA" class="mark a" disabled title="Move the START point to the scrubber  (shortcut: I)"><svg viewBox="0 0 24 24"><path d="M11 4h2v9h3.5L12 18l-4.5-5H11z" /><path d="M5 20h14v2H5z"/></svg>Set</button>
-        <button id="bGoA" class="jump" disabled title="Move the scrubber to the START point"><svg viewBox="0 0 24 24"><path d="M4 11h9V7.5L18 12l-5 4.5V13H4z"/></svg>Go</button>
       </div>
       <div class="grp">
         <span class="lab b">End</span>
         <input type="text" id="inB" value="00:00:00.000" disabled title="Type a time, e.g. 1:23.500">
-        <button id="bSetB" class="mark b" disabled title="Move the END point to the scrubber  (shortcut: O)"><svg viewBox="0 0 24 24"><path d="M11 4h2v9h3.5L12 18l-4.5-5H11z" /><path d="M5 20h14v2H5z"/></svg>Set</button>
-        <button id="bGoB" class="jump" disabled title="Move the scrubber to the END point"><svg viewBox="0 0 24 24"><path d="M4 11h9V7.5L18 12l-5 4.5V13H4z"/></svg>Go</button>
       </div>
       <button id="bReset" class="ghost" disabled title="Select the whole video again">Reset</button>
       <div class="len">
@@ -580,7 +585,7 @@ function loadMedia(j){
   $("rMid").textContent = fmtShort(D / 2);
   $("rEnd").textContent = fmtShort(D);
   /* trimming never needs a decoder, so those controls are always live */
-  var always = ["bPrev","bNext","inA","inB","bSetA","bSetB","bGoA","bGoB","bReset","bSave"];
+  var always = ["bPrev","bNext","inA","inB","bSetA","bSetB","bGoA","bReset","bSave"];
   for (var i = 0; i < always.length; i++) $(always[i]).disabled = false;
   syncPlayButtons();
 
@@ -908,7 +913,6 @@ $("vol").oninput = function(e){
 $("bSetA").onclick = function(){ setA(PH); };
 $("bSetB").onclick = function(){ setB(PH); };
 $("bGoA").onclick  = function(){ playbackPause(); seek(A); };
-$("bGoB").onclick  = function(){ playbackPause(); seek(B); };
 $("bReset").onclick = function(){ A = 0; B = D; render(); toast("Selection reset to the whole video."); };
 
 function commit(which){
