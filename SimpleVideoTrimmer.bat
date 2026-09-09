@@ -275,6 +275,27 @@ $S.Html = @'
   @keyframes sp{to{transform:rotate(360deg)}}
 
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;flex:none}
+
+  /* track list - the clips in the order they play */
+  .tracks{margin-bottom:11px;padding-bottom:11px;border-bottom:1px solid var(--line)}
+  .tkhead{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+  .tkhint{font-size:12px;color:#6c7986;flex:1;min-width:0}
+  .tklist{display:flex;flex-direction:column;gap:5px;max-height:132px;overflow-y:auto}
+  .tklist:empty{display:none}
+  .tk{display:flex;align-items:center;gap:9px;padding:5px 8px;border-radius:7px;
+    background:#0b0f14;border:1px solid var(--line)}
+  .tk.on{border-color:var(--accent2);background:#111a26}
+  .tk .no{font:12px/1 "Consolas",monospace;color:var(--bg);background:var(--dim);
+    border-radius:4px;padding:4px 6px;min-width:20px;text-align:center;font-weight:700;flex:none}
+  .tk.on .no{background:var(--accent)}
+  .tk .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+  .tk .meta{font:11px/1 "Consolas",monospace;color:#6c7986;white-space:nowrap;flex:none}
+  .tk .warn{color:var(--warn);flex:none}
+  .tk .warn svg{width:13px;height:13px}
+  .tk button{padding:4px 6px;background:transparent;border-color:transparent}
+  .tk button svg{width:13px;height:13px}
+  .tk button:hover:not(:disabled){background:#243040;border-color:#3b4a5c}
+  .tk button.rm:hover:not(:disabled){background:#341d1c;border-color:#96413d;color:#ff9d96}
   .transport{display:flex;align-items:center;gap:10px;margin-bottom:11px;flex-wrap:wrap}
   .time{font:13px/1 "Consolas","Cascadia Mono",monospace;color:var(--dim);white-space:nowrap}
   .time b{color:var(--text);font-weight:600}
@@ -286,8 +307,10 @@ $S.Html = @'
   .tl.busy{background-image:linear-gradient(90deg,#0b0f14,#18202b,#0b0f14);
     background-size:200% 100%;animation:sh 1.4s linear infinite}
   @keyframes sh{0%{background-position:100% 0}100%{background-position:-100% 0}}
-  #strip{position:absolute;left:0;right:0;top:0;bottom:0;background-repeat:no-repeat;
-    background-size:100% 100%;opacity:.85}
+  /* one filmstrip slice per track, widths proportional to their durations */
+  #strip{position:absolute;left:0;right:0;top:0;bottom:0;opacity:.85}
+  #strip .sv{position:absolute;top:0;bottom:0;background-repeat:no-repeat;background-size:100% 100%}
+  #strip .sv.j{border-left:2px solid #7dc0ff;box-shadow:-2px 0 6px rgba(0,0,0,.7)}
   .shade{position:absolute;top:0;bottom:0;background:rgba(5,8,12,.72);pointer-events:none}
   .sel{position:absolute;top:0;bottom:0;border-top:2px solid var(--accent);border-bottom:2px solid var(--accent);
     background:rgba(77,163,255,.10);pointer-events:none}
@@ -372,7 +395,6 @@ $S.Html = @'
 
 <header>
   <div class="brand">Simple <span>Video Trimmer</span></div>
-  <button id="bOpen" class="primary"><svg viewBox="0 0 24 24"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z"/></svg>Open Video</button>
   <div class="fname" id="fname">No video loaded</div>
   <button id="bQuit" class="ghost" title="Shut down the local server">Quit</button>
 </header>
@@ -388,13 +410,22 @@ $S.Html = @'
     <div class="empty" id="empty">
       <svg viewBox="0 0 24 24"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V4h-4z"/></svg>
       <h2>No video loaded</h2>
-      <p>Open an MP4, M4V, MOV or WebM file to start trimming.</p>
-      <button id="bOpen2" class="primary">Choose a video...</button>
+      <p>Add an MP4, M4V, MOV or WebM file to start. Add more to stitch them end to end.</p>
+      <button id="bOpen2" class="primary">Add your first video...</button>
     </div>
     <img id="frame" alt="">
   </div>
 
   <div class="panel">
+    <div class="tracks" id="tracks">
+      <div class="tkhead">
+        <span class="lab">Tracks</span>
+        <span class="tkhint" id="tkHint">played in order, one after another</span>
+        <button id="bAdd" class="primary"><svg viewBox="0 0 24 24"><path d="M13 11V5h-2v6H5v2h6v6h2v-6h6v-2z"/></svg>Add Track</button>
+      </div>
+      <div class="tklist" id="tkList"></div>
+    </div>
+
     <div class="transport">
       <button id="bSetA" class="mark a" disabled title="Move the START point to the scrubber  (shortcut: I)"><svg viewBox="0 0 24 24"><path d="M11 4h2v9h3.5L12 18l-4.5-5H11z" /><path d="M5 20h14v2H5z"/></svg>Set Start</button>
       <button id="bPlay" disabled title="Play / Pause (Space)"><svg id="icPlay" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg><span id="txPlay">Play</span></button>
@@ -462,10 +493,18 @@ function $(id){ return document.getElementById(id); }
 var v = $("v");
 var MIN_LEN = 0.05;
 
-var M = null;            // media info from the server
-var A = 0, B = 0, D = 0; // start, end, duration
-var PH = 0;              // playhead, kept independent of <video> so the timeline
-                         // still works on files the browser cannot decode
+/* ---- tracks ----
+   TR holds the clips in the order they play: track 2 starts where track 1 ends.
+   Everything the user touches - the playhead, the trim points, the timeline - is
+   in PROGRAM time, the clips laid end to end. Each track keeps its own cuts and
+   deletions in its OWN source time, so removing or reordering a track carries
+   its edits with it instead of smearing them across the timeline. */
+var TR  = [];            // tracks, in play order
+var cur = -1;            // index of the track the playhead is sitting in
+var M = null;            // TR[cur] - the clip currently loaded in the <video>
+var A = 0, B = 0, D = 0; // trim start, trim end, total program length
+var PH = 0;              // playhead in program time, kept independent of <video>
+                         // so the timeline still works on undecodable files
 var vOk = false;         // is the <video> element actually usable?
 var mode = "video";      // "video" = browser decodes it | "frames" = live-remuxed stream
 var playStart = 0;       // offset the preview stream was started at
@@ -473,30 +512,79 @@ var dragging = null;     // "A" | "B" | "scrub"
 var resumeAfterScrub = false;
 var selPlay = false;
 var pollTimer = null;
+var saving = false;   // an export is in flight and owns the Save button label
 
 /* ---- cuts and deleted sections ----
-   The timeline always shows SOURCE time - it has to, because the filmstrip
-   behind it is one fixed render of the whole file. So a deleted section stays
-   where it is and is drawn struck through; the closing-up happens in the
+   The timeline always shows the program as it stands - it has to, because the
+   filmstrips behind it are fixed renders of whole files. So a deleted section
+   stays where it is and is drawn struck through; the closing-up happens in the
    output, whose length is what the "Clip length" box reports.
 
    Deletions are stored as time RANGES rather than segment indices on purpose:
    adding a new split then never has to remap which segments were deleted. */
-var cuts = [];           // split points in source time, sorted, exclusive of 0 and D
-var dels = [];           // deleted [start,end] ranges, sorted and merged
 var selSeg = -1;         // index into segments() of the highlighted section
-var hist = [];           // undo snapshots of {cuts, dels, selSeg}
+var hist = [];           // undo snapshots
 var skipGuardUntil = 0;  // suppress skip checks until the playhead passes this
-var restarting = false;  // a preview stream is being respun across a cut
+var restarting = false;  // the <video> is being respun across a cut or a join
+var skipTimer = null;    // handle for the restarting-flag timeout, so a second skip can cancel it
 
 var EPS = 0.0005;
 function frameEps(){ return Math.max(0.02, 0.5 / ((M && M.fps) || 25)); }
 
+/* ---- program time <-> track-local time ---- */
+function trackOff(i){
+  var o = 0;
+  for (var k = 0; k < i && k < TR.length; k++) o += TR[k].dur;
+  return o;
+}
+function trackAt(t){
+  var o = 0;
+  for (var i = 0; i < TR.length; i++){
+    if (t < o + TR[i].dur - 1e-9) return i;
+    o += TR[i].dur;
+  }
+  return TR.length ? TR.length - 1 : -1;
+}
+function toLocal(t){
+  var i = trackAt(t);
+  if (i < 0) return null;
+  return { i: i, t: clamp(t - trackOff(i), 0, TR[i].dur) };
+}
+
+/* Program-time views of every track's edits, rebuilt whenever anything moves.
+   A track boundary counts as a cut, so no section ever spans two clips - which
+   is what lets a section be mapped back to exactly one track on export. */
+var cutsP = [], delsP = [];
+function recalc(){
+  var i, j, o = 0;
+  D = 0;
+  for (i = 0; i < TR.length; i++) D += TR[i].dur;
+  cutsP = []; delsP = [];
+  for (i = 0; i < TR.length; i++){
+    if (i > 0) cutsP.push(o);
+    for (j = 0; j < TR[i].cuts.length; j++) cutsP.push(o + TR[i].cuts[j]);
+    for (j = 0; j < TR[i].dels.length; j++) delsP.push([o + TR[i].dels[j][0], o + TR[i].dels[j][1]]);
+    o += TR[i].dur;
+  }
+  cutsP.sort(function(x, y){ return x - y; });
+  delsP.sort(function(x, y){ return x[0] - y[0]; });
+  var m = [];
+  for (i = 0; i < delsP.length; i++){
+    if (m.length && delsP[i][0] <= m[m.length - 1][1] + EPS){
+      if (delsP[i][1] > m[m.length - 1][1]) m[m.length - 1][1] = delsP[i][1];
+    } else m.push([delsP[i][0], delsP[i][1]]);
+  }
+  delsP = m;
+  A = clamp(A, 0, D);
+  B = clamp(B, 0, D);
+  if (B < A) B = D;
+}
+
 /* [0, ...cuts, D] -> the sections the user sees and clicks */
 function segments(){
-  if (!M || !(D > 0)) return [];
+  if (!TR.length || !(D > 0)) return [];
   var b = [0], i;
-  for (i = 0; i < cuts.length; i++) b.push(cuts[i]);
+  for (i = 0; i < cutsP.length; i++) b.push(cutsP[i]);
   b.push(D);
   b.sort(function(x, y){ return x - y; });
   var out = [];
@@ -508,43 +596,56 @@ function segments(){
   return out;
 }
 function inDel(t){
-  for (var i = 0; i < dels.length; i++) if (t > dels[i][0] && t < dels[i][1]) return true;
+  for (var i = 0; i < delsP.length; i++) if (t > delsP[i][0] && t < delsP[i][1]) return true;
   return false;
 }
 /* the far edge of the deleted range containing t, or -1 */
 function delEndAt(t){
-  for (var i = 0; i < dels.length; i++) if (t >= dels[i][0] && t < dels[i][1] - EPS) return dels[i][1];
+  for (var i = 0; i < delsP.length; i++) if (t >= delsP[i][0] && t < delsP[i][1] - EPS) return delsP[i][1];
   return -1;
 }
 function segAt(t){
   var sg = segments();
+  if (!sg.length) return -1;
+  if (t <= sg[0].s) return 0;          /* below zero is the FIRST section, not the last */
   for (var i = 0; i < sg.length; i++) if (t >= sg[i].s && t <= sg[i].e) return i;
-  return sg.length ? sg.length - 1 : -1;
+  return sg.length - 1;
 }
-function normDels(){
-  dels.sort(function(x, y){ return x[0] - y[0]; });
+function normTrackDels(i){
+  var d = TR[i].dels;
+  d.sort(function(x, y){ return x[0] - y[0]; });
   var out = [];
-  for (var i = 0; i < dels.length; i++){
-    var r = dels[i];
-    if (out.length && r[0] <= out[out.length - 1][1] + EPS){
-      if (r[1] > out[out.length - 1][1]) out[out.length - 1][1] = r[1];
-    } else out.push([r[0], r[1]]);
+  for (var k = 0; k < d.length; k++){
+    if (out.length && d[k][0] <= out[out.length - 1][1] + EPS){
+      if (d[k][1] > out[out.length - 1][1]) out[out.length - 1][1] = d[k][1];
+    } else out.push([d[k][0], d[k][1]]);
   }
-  dels = out;
+  TR[i].dels = out;
 }
-function addDel(s, e){ dels.push([s, e]); normDels(); }
+/* both take PROGRAM time and write back to whichever track owns it */
+function addDel(s, e){
+  var i = trackAt((s + e) / 2);
+  if (i < 0) return;
+  var o = trackOff(i);
+  TR[i].dels.push([clamp(s - o, 0, TR[i].dur), clamp(e - o, 0, TR[i].dur)]);
+  normTrackDels(i);
+  recalc();
+}
 function subDel(s, e){
-  var out = [];
-  for (var i = 0; i < dels.length; i++){
-    var r = dels[i];
-    if (r[1] <= s + EPS || r[0] >= e - EPS){ out.push(r); continue; }
-    if (r[0] < s - EPS) out.push([r[0], s]);
-    if (r[1] > e + EPS) out.push([e, r[1]]);
+  var i = trackAt((s + e) / 2);
+  if (i < 0) return;
+  var o = trackOff(i), s0 = s - o, e0 = e - o, out = [], k;
+  for (k = 0; k < TR[i].dels.length; k++){
+    var r = TR[i].dels[k];
+    if (r[1] <= s0 + EPS || r[0] >= e0 - EPS){ out.push(r); continue; }
+    if (r[0] < s0 - EPS) out.push([r[0], s0]);
+    if (r[1] > e0 + EPS) out.push([e0, r[1]]);
   }
-  dels = out;
+  TR[i].dels = out;
+  recalc();
 }
 
-/* what actually gets exported: kept sections clipped to the A/B trim */
+/* kept sections in program time - what the length box and Play Selection use */
 function keptRanges(){
   var sg = segments(), out = [];
   for (var i = 0; i < sg.length; i++){
@@ -556,15 +657,45 @@ function keptRanges(){
   }
   return out;
 }
+/* the same sections for export, each mapped back to its own track's source
+   time and kept separate across joins so the encoder concatenates them in order */
+function keptParts(){
+  var sg = segments(), out = [];
+  for (var i = 0; i < sg.length; i++){
+    if (sg[i].del) continue;
+    var s = Math.max(sg[i].s, A), e = Math.min(sg[i].e, B);
+    if (e - s < 0.01) continue;
+    var k = trackAt((s + e) / 2);
+    if (k < 0) continue;
+    var o = trackOff(k);
+    out.push({ t: TR[k].token,
+               s: +clamp(s - o, 0, TR[k].dur).toFixed(6),
+               e: +clamp(e - o, 0, TR[k].dur).toFixed(6) });
+  }
+  return out;
+}
 function outLen(){
   var r = keptRanges(), t = 0;
   for (var i = 0; i < r.length; i++) t += r[i][1] - r[i][0];
   return t;
 }
-function hasEdits(){ return cuts.length > 0 || dels.length > 0; }
+function hasEdits(){
+  for (var i = 0; i < TR.length; i++) if (TR[i].cuts.length || TR[i].dels.length) return true;
+  return false;
+}
 
-function snapshot(){
-  hist.push({ cuts: cuts.slice(), dels: dels.map(function(r){ return r.slice(); }), sel: selSeg });
+/* An undo entry keeps the track ORDER and each track's edits, so adding,
+   removing and reordering are undoable alongside splits and deletes. Only the
+   track-list operations restore A/B as well - reverting a split should not also
+   throw away trim handles the user has moved since. */
+function snapshot(withTrim){
+  hist.push({
+    order: TR.slice(),
+    edits: TR.map(function(t){
+      return { o: t, cuts: t.cuts.slice(), dels: t.dels.map(function(r){ return r.slice(); }) };
+    }),
+    sel: selSeg, A: A, B: B, ab: !!withTrim
+  });
   if (hist.length > 60) hist.shift();
 }
 
@@ -651,8 +782,8 @@ function render(){
 function renderSegs(){
   var host = $("segs");
   while (host.firstChild) host.removeChild(host.firstChild);
-  if (!M || !(D > 0)) return;
-  var sg = segments(), i, el;
+  if (!TR.length || !(D > 0)) return;
+  var sg = segments(), i, j, el;
   var pct = function(t){ return clamp(t / D, 0, 1) * 100; };
 
   for (i = 0; i < sg.length; i++){
@@ -663,13 +794,19 @@ function renderSegs(){
     el.style.width = Math.max(0, pct(sg[i].e) - pct(sg[i].s)) + "%";
     host.appendChild(el);
   }
-  for (i = 0; i < cuts.length; i++){
-    el = document.createElement("div");
-    el.className = "cut";
-    el.style.left = pct(cuts[i]) + "%";
-    host.appendChild(el);
+  /* only the user's own splits get a marker - the joins between tracks are
+     already drawn as dividers on the filmstrip itself */
+  var o = 0;
+  for (i = 0; i < TR.length; i++){
+    for (j = 0; j < TR[i].cuts.length; j++){
+      el = document.createElement("div");
+      el.className = "cut";
+      el.style.left = pct(o + TR[i].cuts[j]) + "%";
+      host.appendChild(el);
+    }
+    o += TR[i].dur;
   }
-  if (selSeg >= 0 && selSeg < sg.length && cuts.length){
+  if (selSeg >= 0 && selSeg < sg.length && sg.length > 1){
     el = document.createElement("div");
     el.className = "pick";
     el.style.left  = pct(sg[selSeg].s) + "%";
@@ -686,8 +823,8 @@ function syncEditButtons(){
   $("bReset").disabled = !on;
 
   var sg = on ? segments() : [];
-  var cur = (selSeg >= 0 && selSeg < sg.length) ? sg[selSeg] : null;
-  var restore = !!(cur && cur.del);
+  var sec = (selSeg >= 0 && selSeg < sg.length) ? sg[selSeg] : null;
+  var restore = !!(sec && sec.del);
   $("txDel").textContent = restore ? "Restore Section" : "Delete Section";
   $("icDel").innerHTML = restore
     ? '<path d="M13 3a9 9 0 0 0-9 9H1l4 4 4-4H6a7 7 0 1 1 7 7v2a9 9 0 0 0 0-18z"/>'
@@ -696,16 +833,26 @@ function syncEditButtons(){
     ? "Put the highlighted section back into the video (shortcut: Delete)"
     : "Remove the highlighted section - what is left closes up (shortcut: Delete)";
   /* nothing to delete until there is more than one section to choose between */
-  $("bDel").disabled = !cur || (!restore && sg.length < 2);
+  $("bDel").disabled = !sec || (!restore && sg.length < 2);
+
+  /* an export in flight owns this label - do not stomp on its progress text */
+  if (!saving){
+    var many = TR.length > 1;
+    $("txSave").textContent = many ? "Save Stitched Video" : "Save Trimmed Video";
+    $("bSave").title = many
+      ? "Stitch the tracks together and save as MP4 (Ctrl+S)"
+      : "Trim and save as MP4 (Ctrl+S)";
+  }
 }
 
 /* A split is pointless on top of an existing boundary, and a zero-length
    section would only confuse the export. */
 function canSplitAt(t){
-  if (!M || !(D > 0)) return false;
+  if (!TR.length || !(D > 0)) return false;
   var eps = frameEps(), i;
   if (t <= eps || t >= D - eps) return false;
-  for (i = 0; i < cuts.length; i++) if (Math.abs(cuts[i] - t) < eps) return false;
+  /* cutsP carries the track joins too, so a join never gets split again */
+  for (i = 0; i < cutsP.length; i++) if (Math.abs(cutsP[i] - t) < eps) return false;
   return true;
 }
 function renderPlayhead(){
@@ -716,9 +863,9 @@ function renderPlayhead(){
   if (M) $("bSplit").disabled = !canSplitAt(PH);
 }
 
-/* ---------------------------- open a video ---------------------------- */
-function openVideo(){
-  $("bOpen").disabled = true; $("bOpen2").disabled = true;
+/* ------------------------------ tracks -------------------------------- */
+function addTrack(){
+  $("bAdd").disabled = true; $("bOpen2").disabled = true;
   var waiting = toast("Waiting for the file dialog...", "");
   fetch(api("/api/open"), { method: "POST" })
     .then(function(r){ return r.json(); })
@@ -726,76 +873,233 @@ function openVideo(){
       kill(waiting);
       if (j.cancelled) return;
       if (!j.ok){ toast(j.error || "Could not open that file.", "bad"); return; }
-      loadMedia(j);
+      acceptTrack(j);
     })
     .catch(function(e){ kill(waiting); toast("Could not reach the local server: " + e.message, "bad"); })
-    .then(function(){ $("bOpen").disabled = false; $("bOpen2").disabled = false; });
+    .then(function(){ $("bAdd").disabled = false; $("bOpen2").disabled = false; });
 }
 
-function loadMedia(j){
-  M = j; D = j.duration; A = 0; B = D; selPlay = false;
-  cuts = []; dels = []; hist = []; selSeg = -1;
-  skipGuardUntil = 0; restarting = false;
-  var fn = $("fname");
-  while (fn.firstChild) fn.removeChild(fn.firstChild);
-  var b = document.createElement("b"); b.textContent = j.name;
-  fn.appendChild(b);
-  fn.appendChild(document.createTextNode(
-    "  -  " + j.width + "x" + j.height + " - " + j.fps.toFixed(2) + " fps - " +
-    j.sizeText + " - " + fmt(D, false)));
+function acceptTrack(j){
+  var first = TR.length === 0;
+  /* a selection that ran to the end should grow to cover the new clip */
+  var toEnd = first || Math.abs(B - D) < EPS;
+  snapshot(true);
+  j.dur  = j.duration;
+  j.cuts = [];
+  j.dels = [];
+  TR.push(j);
+  recalc();
+  if (first){ A = 0; B = D; }
+  else if (toEnd) B = D;
+  selPlay = false;
+  selSeg = -1;
 
   $("empty").style.display = "none";
-  PH = 0;
-  playStart = 0;
-  stopStream();
-  if (j.playable){
-    mode = "video";
-    vOk = true;
-    $("notice").style.display = "none";
-    $("frame").style.display = "none";
-    $("frame").removeAttribute("src");
-    v.style.display = "block";
-    v.src = api("/api/stream", "t=" + j.token);
-    v.load();
-  } else {
-    enterFramesMode(j);
-  }
-
   $("tDur").textContent = fmt(D);
   $("rMid").textContent = fmtShort(D / 2);
   $("rEnd").textContent = fmtShort(D);
   /* trimming never needs a decoder, so those controls are always live */
   var always = ["bPrev","bNext","inA","inB","bSetA","bSetB","bGoA","bReset","bSave"];
   for (var i = 0; i < always.length; i++) $(always[i]).disabled = false;
-  syncPlayButtons();
 
-  render();
-  loadStrip(j.token);
+  if (first){ PH = 0; activate(0, 0, false); }
+  refreshProgram();
+  if (!first){
+    toast("Track " + TR.length + " added - " + j.name + " plays after track " + (TR.length - 1) + ".", "good");
+    if (mismatch(j)) noteMismatch(j);
+  }
 }
 
-function loadStrip(token){
-  var tl = $("tl");
+function removeTrack(i){
+  if (i < 0 || i >= TR.length) return;
+  var wasName = TR[i].name;
+  snapshot(true);
+  var toEnd = Math.abs(B - D) < EPS;
+  TR.splice(i, 1);
+  recalc();
+  if (toEnd || B > D) B = D;
+  selSeg = -1;
+  if (!TR.length){ clearProgram(); toast("Removed " + wasName + " - no tracks left.", ""); return; }
+  if (cur >= TR.length) cur = TR.length - 1;
+  refreshProgram();
+  goTo(clamp(PH, 0, D), false);
+  activate(trackAt(PH), toLocal(PH).t, false);
+  toast("Removed " + wasName + ".", "");
+}
+
+function moveTrack(i, dir){
+  var k = i + dir;
+  if (i < 0 || i >= TR.length || k < 0 || k >= TR.length) return;
+  snapshot(true);
+  var t = TR[i]; TR[i] = TR[k]; TR[k] = t;
+  recalc();
+  selSeg = -1;
+  cur = TR.indexOf(M);
+  refreshProgram();
+  goTo(clamp(PH, 0, D), false);
+}
+
+function clearProgram(){
+  TR = []; cur = -1; M = null; D = 0; A = 0; B = 0; PH = 0;
+  cutsP = []; delsP = []; selSeg = -1; selPlay = false;
+  skipGuardUntil = 0; restarting = false;
+  /* the undo stack has to go with it: nothing in it refers to anything still
+     loaded, and Ctrl+Z has no !!M guard, so leaving it would let a discarded
+     file come back on top of whatever the user opens next */
+  hist = [];
+  if (skipTimer){ clearTimeout(skipTimer); skipTimer = null; }
+  stopStream();
+  v.style.display = "none";
+  $("frame").style.display = "none";
+  $("frame").removeAttribute("src");
+  $("notice").style.display = "none";
+  $("empty").style.display = "block";
+  $("fname").textContent = "No video loaded";
+  $("tDur").textContent = fmt(0);
+  $("rMid").textContent = "--:--"; $("rEnd").textContent = "--:--";
+  var off = ["bPrev","bNext","inA","inB","bSetA","bSetB","bGoA","bReset","bSave","bPlay","bSel"];
+  for (var i = 0; i < off.length; i++) $(off[i]).disabled = true;
+  renderTracks(); renderStrips(); render();
+}
+
+/* everything that has to be redrawn when the track list itself changes */
+function refreshProgram(){
+  $("tDur").textContent = fmt(D);
+  $("rMid").textContent = fmtShort(D / 2);
+  $("rEnd").textContent = fmtShort(D);
+  renderHeader();
+  renderTracks();
+  renderStrips();
+  syncPlayButtons();
+  render();
+}
+
+function renderHeader(){
+  var fn = $("fname");
+  while (fn.firstChild) fn.removeChild(fn.firstChild);
+  if (!TR.length){ fn.textContent = "No video loaded"; return; }
+  var b = document.createElement("b");
+  if (TR.length === 1){
+    b.textContent = TR[0].name;
+    fn.appendChild(b);
+    fn.appendChild(document.createTextNode(
+      "  -  " + TR[0].width + "x" + TR[0].height + " - " + TR[0].fps.toFixed(2) + " fps - " +
+      TR[0].sizeText + " - " + fmt(D, false)));
+  } else {
+    b.textContent = TR.length + " tracks";
+    fn.appendChild(b);
+    fn.appendChild(document.createTextNode(
+      "  -  stitched end to end - output " + TR[0].width + "x" + TR[0].height + " at " +
+      TR[0].fps.toFixed(2) + " fps (from track 1) - " + fmt(D, false)));
+  }
+}
+
+/* Track 1 sets the output format, so anything that differs gets scaled and
+   letterboxed into it. Say so once, when the track is added. */
+function mismatch(j){
+  if (!TR.length) return false;
+  var t0 = TR[0];
+  return j.width !== t0.width || j.height !== t0.height ||
+         Math.abs(j.fps - t0.fps) > 0.01 || (!!j.hasAudio !== !!t0.hasAudio);
+}
+function noteMismatch(j){
+  var t0 = TR[0], bits = [];
+  if (j.width !== t0.width || j.height !== t0.height)
+    bits.push(j.width + "x" + j.height + " will be fitted into " + t0.width + "x" + t0.height);
+  if (Math.abs(j.fps - t0.fps) > 0.01)
+    bits.push(j.fps.toFixed(2) + " fps will be resampled to " + t0.fps.toFixed(2));
+  if (!j.hasAudio && t0.hasAudio) bits.push("it has no audio, so that stretch will be silent");
+  if (j.hasAudio && !t0.hasAudio) bits.push("its audio will be kept");
+  if (bits.length) toast("Track " + TR.length + ": " + bits.join("; ") + ".", "warn");
+}
+
+function renderTracks(){
+  var host = $("tkList");
+  while (host.firstChild) host.removeChild(host.firstChild);
+  $("tkHint").textContent = TR.length > 1
+    ? "played in order, one after another - track 1 sets the output size"
+    : "played in order, one after another";
+  for (var i = 0; i < TR.length; i++) host.appendChild(trackRow(i));
+}
+
+function trackRow(i){
+  var t = TR[i];
+  var row = document.createElement("div");
+  row.className = "tk" + (i === cur ? " on" : "");
+
+  var no = document.createElement("span");
+  no.className = "no"; no.textContent = String(i + 1);
+  row.appendChild(no);
+
+  var nm = document.createElement("span");
+  nm.className = "nm"; nm.textContent = t.name; nm.title = t.name;
+  row.appendChild(nm);
+
+  if (!t.playable){
+    var w = document.createElement("span");
+    w.className = "warn"; w.title = "Preview only - " + (t.why || "unsupported codec");
+    w.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 1 21h22L12 2zm1 14h-2v2h2v-2zm0-7h-2v5h2V9z"/></svg>';
+    row.appendChild(w);
+  }
+
+  var meta = document.createElement("span");
+  meta.className = "meta";
+  meta.textContent = t.width + "x" + t.height + "  " + fmt(t.dur, false);
+  row.appendChild(meta);
+
+  row.appendChild(mini("Jump to the start of this track",
+    '<path d="M4 11h9V7.5L18 12l-5 4.5V13H4z"/>', "", function(){ playbackPause(); seek(trackOff(i)); }));
+  row.appendChild(mini("Move earlier", '<path d="M12 8l-6 6h12z"/>', "",
+    function(){ moveTrack(i, -1); }, i === 0));
+  row.appendChild(mini("Move later", '<path d="M12 16l6-6H6z"/>', "",
+    function(){ moveTrack(i, 1); }, i === TR.length - 1));
+  row.appendChild(mini("Remove this track",
+    '<path d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>',
+    "rm", function(){ removeTrack(i); }));
+  return row;
+}
+
+function mini(title, path, cls, fn, disabled){
+  var b = document.createElement("button");
+  b.className = cls; b.title = title; b.disabled = !!disabled;
+  b.innerHTML = '<svg viewBox="0 0 24 24">' + path + '</svg>';
+  b.onclick = fn;
+  return b;
+}
+
+/* one filmstrip per track, each sized to its share of the program */
+function renderStrips(){
+  var host = $("strip"), tl = $("tl");
+  while (host.firstChild) host.removeChild(host.firstChild);
+  if (!TR.length || !(D > 0)){ tl.className = "tl"; return; }
   tl.className = "tl busy";
-  $("strip").style.backgroundImage = "";
-  var url = api("/api/strip", "t=" + token);
-  var img = new Image();
-  img.onload = function(){
-    tl.className = "tl";
-    $("strip").style.backgroundImage = "url('" + url + "')";
-    $("popImg").style.backgroundImage = "url('" + url + "')";
-    $("popImg").style.backgroundSize = (M.tiles * M.tileW) + "px " + M.tileH + "px";
-  };
-  img.onerror = function(){ tl.className = "tl"; };
-  img.src = url;
+  var left = TR.length, o = 0;
+  var settle = function(){ if (--left <= 0) tl.className = "tl"; };
+  for (var i = 0; i < TR.length; i++){
+    var url = api("/api/strip", "t=" + TR[i].token);
+    var el = document.createElement("div");
+    el.className = "sv" + (i ? " j" : "");
+    el.style.left  = (o / D * 100) + "%";
+    el.style.width = (TR[i].dur / D * 100) + "%";
+    host.appendChild(el);
+    (function(el, url){
+      var img = new Image();
+      img.onload  = function(){ el.style.backgroundImage = "url('" + url + "')"; settle(); };
+      img.onerror = settle;
+      img.src = url;
+    })(el, url);
+    o += TR[i].dur;
+  }
 }
 
 /* ---------- files the browser cannot decode: stills + sidecar audio ---------- */
 /* One frame is ~100ms server-side, so requests are coalesced rather than queued. */
 var frameBusy = false, framePending = null, lastFrameAt = -1;
 
+/* takes time LOCAL to the active track, since the frame comes from its file */
 function showFrame(t){
   if (mode !== "frames" || !M) return;
-  var at = clamp(t, 0, D);
+  var at = clamp(t, 0, M.dur);
   if (Math.abs(at - lastFrameAt) < 0.0005 && lastFrameAt >= 0) return;
   if (frameBusy){ framePending = at; return; }
   frameBusy = true;
@@ -839,12 +1143,9 @@ function guardPlay(){
   });
 }
 
-function playbackPlay(){
-  if (!canPlayNow()) return;
-  if (PH >= D - 0.05) seek(0);
-  if (mode === "video"){ guardPlay(); return; }
-
-  var want = PH;
+/* starts the live-remuxed preview stream at a track-LOCAL offset */
+function streamFrom(want){
+  if (!M) return;
   playStart = want;                /* corrected below once the real start is known */
   $("frame").style.display = "none";
   v.style.display = "block";
@@ -855,10 +1156,18 @@ function playbackPlay(){
 
   /* a stream copy can only begin on a keyframe, so ask where it really starts;
      runs alongside the stream so play is not held up waiting for it */
-  fetch(api("/api/playinfo", "t=" + M.token + "&at=" + want.toFixed(6)))
+  var tok = M.token;
+  fetch(api("/api/playinfo", "t=" + tok + "&at=" + want.toFixed(6)))
     .then(function(r){ return r.json(); })
-    .then(function(j){ if (j && j.ok && isFinite(j.start)) playStart = j.start; })
+    .then(function(j){ if (j && j.ok && isFinite(j.start) && M && M.token === tok) playStart = j.start; })
     .catch(function(){ });
+}
+
+function playbackPlay(){
+  if (!canPlayNow()) return;
+  if (PH >= D - 0.05) seek(0);
+  if (mode === "video"){ guardPlay(); return; }
+  streamFrom(clamp(PH - trackOff(cur), 0, M.dur));
 }
 
 /* Tearing the stream down fires timeupdate with currentTime 0, so the playhead
@@ -870,7 +1179,7 @@ function exitStreamToStill(){
   $("frame").style.display = "block";
   PH = at;
   lastFrameAt = -1;
-  showFrame(at);
+  showFrame(at - trackOff(cur));
   setPlayIcon(false);
 }
 
@@ -896,7 +1205,7 @@ function syncPlayButtons(){
     : "Play only the selected range";
 }
 
-function enterFramesMode(j){
+function enterFramesMode(j, localT, keepPlaying){
   mode = "frames";
   vOk = false;
   v.style.display = "none";
@@ -905,12 +1214,67 @@ function enterFramesMode(j){
   $("frame").style.display = "block";
   $("notice").style.display = "flex";
   $("noticeText").textContent =
-    "Preview mode - your browser cannot decode this file directly because " + (j.why || "of an unsupported codec") +
+    "Preview mode - your browser cannot decode " + j.name + " directly because " +
+    (j.why || "of an unsupported codec") +
     ", so it is converted on the fly as you play. This affects preview only - the video you " +
-    "save is trimmed from the original file, at full quality.";
+    "save is built from the original files, at full quality.";
   lastFrameAt = -1;
-  showFrame(0);
+  if (keepPlaying) streamFrom(localT || 0); else showFrame(localT || 0);
   syncPlayButtons();
+}
+
+/* ------------------- moving between tracks at a join ------------------- */
+/* Only one clip is ever loaded in the <video> element, so crossing a join means
+   swapping its source. That costs a short stall - unavoidable without a second
+   element, and the same stall the preview stream already pays across a cut. */
+var pendingSeek = -1;
+
+function activate(i, localT, keepPlaying){
+  if (i < 0 || i >= TR.length) return;
+  cur = i; M = TR[i];
+  playStart = 0;
+  lastFrameAt = -1;
+  framePending = null;
+  stopStream();
+  if (M.playable){
+    mode = "video";
+    vOk = true;
+    $("notice").style.display = "none";
+    $("frame").style.display = "none";
+    $("frame").removeAttribute("src");
+    v.style.display = "block";
+    pendingSeek = clamp(localT || 0, 0, M.dur);
+    v.src = api("/api/stream", "t=" + M.token);
+    v.load();
+    if (keepPlaying){ restarting = true; guardPlay(); }
+  } else {
+    enterFramesMode(M, clamp(localT || 0, 0, M.dur), keepPlaying);
+  }
+  syncPlayButtons();
+  renderTracks();
+}
+
+/* the single way the playhead moves in program time */
+function goTo(t, keepPlaying){
+  if (!TR.length) return;
+  PH = clamp(t, 0, D);
+  var L = toLocal(PH);
+  if (!L) return;
+  if (L.i !== cur){
+    if (keepPlaying) restarting = true;
+    activate(L.i, L.t, keepPlaying);
+    renderPlayhead();
+    return;
+  }
+  if (mode === "video"){
+    if (vOk){ try { v.currentTime = L.t; } catch (e) {} }
+    if (keepPlaying && v.paused) guardPlay();
+  } else if (keepPlaying){
+    streamFrom(L.t);
+  } else {
+    if (playbackIsPlaying()) exitStreamToStill(); else showFrame(L.t);
+  }
+  renderPlayhead();
 }
 
 /* --------------------------- timeline input --------------------------- */
@@ -920,15 +1284,8 @@ function posToTime(clientX){
 }
 function seek(t){
   if (!M) return;
-  PH = clamp(t, 0, D);
   skipGuardUntil = 0;   /* an explicit move always beats a pending skip */
-  if (mode === "video"){
-    if (vOk) { try { v.currentTime = PH; } catch (e) {} }
-  } else {
-    if (playbackIsPlaying()) exitStreamToStill();
-    else showFrame(PH);
-  }
-  renderPlayhead();
+  goTo(t, false);
 }
 
 $("tl").addEventListener("pointerdown", function(e){
@@ -972,12 +1329,19 @@ $("tl").addEventListener("pointercancel", endDrag);
 $("tl").addEventListener("pointerleave", function(){ $("pop").style.display = "none"; });
 
 function showPop(clientX){
-  if (!M || !M.tiles) return;
+  if (!TR.length || !(D > 0)) return;
   var r = $("tl").getBoundingClientRect();
   var f = clamp((clientX - r.left) / r.width, 0, 1);
-  var idx = clamp(Math.floor(f * M.tiles), 0, M.tiles - 1);
+  var L = toLocal(f * D);
+  if (!L) return;
+  var tk = TR[L.i];
+  if (!tk.tiles) return;
+  /* the thumbnail has to come from whichever track the cursor is over */
+  var idx = clamp(Math.floor(L.t / tk.dur * tk.tiles), 0, tk.tiles - 1);
   var pop = $("pop");
-  $("popImg").style.backgroundPosition = (-idx * M.tileW) + "px 0";
+  $("popImg").style.backgroundImage = "url('" + api("/api/strip", "t=" + tk.token) + "')";
+  $("popImg").style.backgroundSize = (tk.tiles * tk.tileW) + "px " + tk.tileH + "px";
+  $("popImg").style.backgroundPosition = (-idx * tk.tileW) + "px 0";
   $("popLab").textContent = fmt(f * D, false);
   pop.style.display = "block";
   pop.style.left = clamp(clientX - r.left - 80, 2, Math.max(2, r.width - 162)) + "px";
@@ -987,12 +1351,16 @@ function showPop(clientX){
 function doSplit(){
   if (!M) return;
   if (!canSplitAt(PH)){
-    toast("There is already a cut here - move the scrubber first.", "warn");
+    toast(Math.abs(PH - trackOff(trackAt(PH))) < frameEps() && trackAt(PH) > 0
+      ? "That is already a join between two tracks."
+      : "There is already a cut here - move the scrubber first.", "warn");
     return;
   }
   snapshot();
-  cuts.push(PH);
-  cuts.sort(function(x, y){ return x - y; });
+  var L = toLocal(PH);
+  TR[L.i].cuts.push(L.t);
+  TR[L.i].cuts.sort(function(x, y){ return x - y; });
+  recalc();
   selSeg = segAt(PH);
   render();
   toast("Split at " + fmt(PH, false) + " - click a section, then Delete Section.", "good");
@@ -1005,10 +1373,10 @@ function doDelete(){
     toast("Click a section on the timeline first.", "warn");
     return;
   }
-  var cur = sg[selSeg];
-  if (cur.del){
+  var sec = sg[selSeg];
+  if (sec.del){
     snapshot();
-    subDel(cur.s, cur.e);
+    subDel(sec.s, sec.e);
     render();
     toast("Section restored.", "good");
     return;
@@ -1017,17 +1385,15 @@ function doDelete(){
     toast("Split the video first - there is only one section.", "warn");
     return;
   }
-  /* try it on a copy so we never strand the user with nothing to export */
-  var keep = dels.map(function(r){ return r.slice(); });
-  dels.push([cur.s, cur.e]); normDels();
-  if (outLen() < MIN_LEN){
-    dels = keep;
+  /* section boundaries are always cut boundaries, so deleting one removes
+     exactly its clipped length - no need to try it and roll back */
+  var lose = Math.max(0, Math.min(sec.e, B) - Math.max(sec.s, A));
+  if (outLen() - lose < MIN_LEN){
     toast("That would leave nothing to save.", "warn");
     return;
   }
-  dels = keep;
   snapshot();
-  addDel(cur.s, cur.e);
+  addDel(sec.s, sec.e);
   render();
   /* if the playhead is now inside the hole, walk it out to the join */
   var edge = delEndAt(PH);
@@ -1038,9 +1404,24 @@ function doDelete(){
 
 function doUndo(){
   if (!hist.length){ toast("Nothing to undo.", "warn"); return; }
-  var h = hist.pop();
-  cuts = h.cuts; dels = h.dels; selSeg = h.sel;
-  render();
+  var h = hist.pop(), i;
+  var hadTracks = TR.length;
+  TR = h.order.slice();
+  for (i = 0; i < h.edits.length; i++){
+    h.edits[i].o.cuts = h.edits[i].cuts;
+    h.edits[i].o.dels = h.edits[i].dels;
+  }
+  selSeg = h.sel;
+  if (h.ab){ A = h.A; B = h.B; }
+  recalc();
+  if (!TR.length){ clearProgram(); return; }
+  if (!hadTracks) $("empty").style.display = "none";
+  cur = TR.indexOf(M);
+  refreshProgram();
+  /* the clip under the playhead may be a different one now */
+  var L = toLocal(clamp(PH, 0, D));
+  if (cur < 0 || (L && L.i !== cur)) activate(L ? L.i : 0, L ? L.t : 0, false);
+  else goTo(clamp(PH, 0, D), false);
 }
 
 /* ------------------------- skipping deleted parts ---------------------- */
@@ -1051,26 +1432,20 @@ function doUndo(){
    replayed audio from re-triggering the same jump forever. */
 function skipTo(edge, wasPlaying){
   skipGuardUntil = edge;
-  PH = clamp(edge, 0, D);
-  if (mode === "video"){
-    if (vOk) { try { v.currentTime = PH; } catch (e) {} }
-    renderPlayhead();
-    return;
-  }
   if (wasPlaying){
     restarting = true;
-    setTimeout(function(){ restarting = false; }, 3000);
-    playbackPlay();
-  } else {
-    lastFrameAt = -1;
-    showFrame(PH);
+    /* a second skip must cancel the first one's timer - otherwise the stale one
+       fires mid-respin and clears a flag this skip still owns (and which
+       activate/goTo/ended also set, with no timer of their own) */
+    if (skipTimer) clearTimeout(skipTimer);
+    skipTimer = setTimeout(function(){ restarting = false; skipTimer = null; }, 3000);
   }
-  renderPlayhead();
+  goTo(edge, wasPlaying);
 }
 
 /* Returns true when playback was diverted, so callers stop what they were doing. */
 function skipIfDeleted(){
-  if (!M || !dels.length) return false;
+  if (!M || !delsP.length) return false;
   if (skipGuardUntil > 0){
     if (PH < skipGuardUntil - EPS) return false;   /* still inside the guard */
     skipGuardUntil = 0;
@@ -1105,23 +1480,36 @@ v.addEventListener("pause", function(){
 });
 v.addEventListener("timeupdate", function(){
   if (mode === "frames" && !playbackIsPlaying()) return;
-  PH = (mode === "video") ? v.currentTime : (playStart + v.currentTime);
+  PH = trackOff(cur) + ((mode === "video") ? v.currentTime : (playStart + v.currentTime));
   if (skipIfDeleted()) return;
   if (selPlay && PH >= B){ playbackPause(); selPlay = false; seek(B); }
   renderPlayhead();
 });
 v.addEventListener("seeked", function(){
-  if (mode === "video"){ PH = v.currentTime; renderPlayhead(); }
+  if (mode === "video"){ PH = trackOff(cur) + v.currentTime; renderPlayhead(); }
 });
 v.addEventListener("loadedmetadata", function(){
-  if (M && (!D || !isFinite(D)) && isFinite(v.duration)){ D = v.duration; B = D; render(); }
+  /* a freshly swapped-in track cannot be positioned until its metadata lands */
+  if (pendingSeek >= 0){
+    try { v.currentTime = pendingSeek; } catch (e) {}
+    pendingSeek = -1;
+  }
 });
 v.addEventListener("error", function(){
   if (!M) return;
-  if (mode === "video"){ enterFramesMode(M); }
+  if (mode === "video"){ enterFramesMode(M, clamp(PH - trackOff(cur), 0, M.dur), false); }
   else if (playbackIsPlaying()) { playbackPause(); toast("Preview stream stopped.", "warn"); }
 });
-v.addEventListener("ended", function(){ if (mode === "frames") playbackPause(); });
+/* the end of one clip is the start of the next - that is the whole stitch */
+v.addEventListener("ended", function(){
+  if (!M) return;
+  if (cur < TR.length - 1){
+    restarting = true;
+    goTo(trackOff(cur + 1), true);
+    return;
+  }
+  if (mode === "frames") playbackPause();
+});
 
 function step(dir, big){
   if (!M) return;
@@ -1129,17 +1517,17 @@ function step(dir, big){
   if (big){ seek(PH + dir); return; }
   /* ask for the real timestamp of the neighbouring frame rather than
      assuming frames sit on exact 1/fps boundaries */
-  var from = PH;
-  var fallback = function(){ seek(from + dir / (M.fps || 25)); };
-  fetch(api("/api/step", "t=" + M.token + "&at=" + from.toFixed(6) + "&dir=" + dir))
+  var o = trackOff(cur), from = clamp(PH - o, 0, M.dur), tok = M.token;
+  var fallback = function(){ seek(o + from + dir / (M.fps || 25)); };
+  fetch(api("/api/step", "t=" + tok + "&at=" + from.toFixed(6) + "&dir=" + dir))
     .then(function(r){ return r.json(); })
-    .then(function(j){ if (j && j.ok && isFinite(j.t)) seek(j.t); else fallback(); })
+    .then(function(j){ if (j && j.ok && isFinite(j.t)) seek(o + j.t); else fallback(); })
     .catch(fallback);
 }
 
 /* ------------------------------- wiring ------------------------------- */
-$("bOpen").onclick = openVideo;
-$("bOpen2").onclick = openVideo;
+$("bAdd").onclick = addTrack;
+$("bOpen2").onclick = addTrack;
 $("bPlay").onclick = togglePlay;
 $("bPrev").onclick = function(e){ step(-1, e.shiftKey); };
 $("bNext").onclick = function(e){ step(1, e.shiftKey); };
@@ -1164,10 +1552,14 @@ $("bSplit").onclick = doSplit;
 $("bDel").onclick   = doDelete;
 $("bUndo").onclick  = doUndo;
 $("bReset").onclick = function(){
-  if (hasEdits()) snapshot();
-  A = 0; B = D; cuts = []; dels = []; selSeg = -1; skipGuardUntil = 0;
+  snapshot(true);
+  for (var i = 0; i < TR.length; i++){ TR[i].cuts = []; TR[i].dels = []; }
+  recalc();
+  A = 0; B = D; selSeg = -1; skipGuardUntil = 0;
   render();
-  toast("Every cut cleared - the whole video is selected again.");
+  toast(TR.length > 1
+    ? "Every cut cleared - all " + TR.length + " tracks selected again."
+    : "Every cut cleared - the whole video is selected again.");
 };
 
 function commit(which){
@@ -1203,18 +1595,22 @@ document.addEventListener("keydown", function(e){
 /* -------------------------------- save -------------------------------- */
 function save(){
   if (!M || $("bSave").disabled) return;
-  var segs = keptRanges();
-  if (!segs.length || outLen() < MIN_LEN){
+  var parts = keptParts();
+  if (!parts.length || outLen() < MIN_LEN){
     toast("The selected clip is too short to save.", "warn"); return;
   }
+  saving = true;
   $("bSave").disabled = true;
   $("txSave").textContent = "Choose location...";
   fetch(api("/api/save"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    /* start/end stay for the single-range case, which keeps the fast
-       seek-based export exactly as it was */
-    body: JSON.stringify({ token: M.token, start: A, end: B, segments: segs })
+    /* tokens carries the track order - the server takes the output format from
+       the first of them, and the parts are already in the order they play */
+    body: JSON.stringify({
+      tokens: TR.map(function(t){ return t.token; }),
+      parts: parts
+    })
   })
   .then(function(r){ return r.json(); })
   .then(function(j){
@@ -1228,9 +1624,10 @@ function save(){
   .catch(function(e){ finishSave(); toast("Could not reach the local server: " + e.message, "bad"); });
 }
 function finishSave(){
+  saving = false;
   $("bSave").disabled = false;
-  $("txSave").textContent = "Save Trimmed Video";
   $("bar").style.display = "none";
+  syncEditButtons();          /* restores Trimmed vs Stitched wording */
   if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
 }
 function poll(id){
@@ -1287,6 +1684,17 @@ $res = $ctx.Response
 $inv = [cultureinfo]::InvariantCulture
 
 function Num([double]$v, [string]$f = '0.######') { [string]::Format($inv, "{0:$f}", $v) }
+
+# ProcessStartInfo takes one string, which the child re-splits with
+# CommandLineToArgvW rules. A Windows file name cannot contain a double quote, so
+# wrapping is enough - except that a trailing backslash would escape the closing
+# quote, so any run of them at the end is doubled.
+function Quote-Arg([string]$a) {
+    if ($a -eq '') { return '""' }
+    if ($a -notmatch '[\s"]') { return $a }
+    $tail = [regex]::Match($a, '\*$').Value
+    return '"' + $a.Substring(0, $a.Length - $tail.Length) + ($tail * 2) + '"'
+}
 
 function Send-Bytes([byte[]]$bytes, [string]$type, [int]$code = 200) {
     $res.StatusCode = $code
@@ -1743,53 +2151,82 @@ try {
         '^/api/save$' {
             $body = (New-Object IO.StreamReader($req.InputStream, [Text.Encoding]::UTF8)).ReadToEnd()
             $p    = $body | ConvertFrom-Json
-            $info = $S.Files[[string]$p.token]
-            if (-not $info) { Send-Json @{ ok = $false; error = 'That video is no longer loaded.' }; break }
 
-            # Belt and braces: the browser clamps too, but never trust the client.
-            $a = [math]::Max(0.0, [math]::Min([double]$p.start, $info.duration))
-            $b = [math]::Max(0.0, [math]::Min([double]$p.end,   $info.duration))
-            if ($b -lt $a) { $t = $a; $a = $b; $b = $t }
+            # tokens carries the track order; the FIRST track sets the output
+            # format, which is what everything else gets fitted into.
+            $order = @()
+            if ($p.PSObject.Properties['tokens'] -and $p.tokens) {
+                foreach ($tk in $p.tokens) { if ($S.Files[[string]$tk]) { $order += [string]$tk } }
+            }
+            if ($order.Count -eq 0) { Send-Json @{ ok = $false; error = 'Those videos are no longer loaded.' }; break }
+            $first = $S.Files[$order[0]]
 
-            # The client may send the kept sections left over after splitting and
-            # deleting. Rebuild that list here rather than trusting it: clamp every
-            # edge, drop slivers, sort, and merge anything that touches.
+            # Never trust the client: rebuild the part list here, clamping every
+            # edge to its own track's duration and dropping slivers. Order is
+            # preserved exactly as sent - it IS the order the clips play in.
             $segs = New-Object System.Collections.ArrayList
-            if ($p.PSObject.Properties['segments'] -and $p.segments) {
-                foreach ($sg in $p.segments) {
-                    if ($null -eq $sg -or $sg.Count -lt 2) { continue }
+            if ($p.PSObject.Properties['parts'] -and $p.parts) {
+                foreach ($sg in $p.parts) {
+                    if ($null -eq $sg) { continue }
+                    # must be a loaded file AND one of the tracks we were given
+                    if ($order -notcontains [string]$sg.t) { continue }
+                    $ti = $S.Files[[string]$sg.t]
+                    if (-not $ti) { continue }
                     $s0 = 0.0; $e0 = 0.0
-                    if (-not [double]::TryParse([string]$sg[0], [Globalization.NumberStyles]::Float, $inv, [ref]$s0)) { continue }
-                    if (-not [double]::TryParse([string]$sg[1], [Globalization.NumberStyles]::Float, $inv, [ref]$e0)) { continue }
+                    if (-not [double]::TryParse([string]$sg.s, [Globalization.NumberStyles]::Float, $inv, [ref]$s0)) { continue }
+                    if (-not [double]::TryParse([string]$sg.e, [Globalization.NumberStyles]::Float, $inv, [ref]$e0)) { continue }
+                    # TryParse says yes to "NaN", and every later comparison against
+                    # NaN is false - the reversal test, both clamps, the sliver test
+                    # and the span test - so it would sail all the way through and
+                    # only blow up in [timespan]::FromSeconds. (Infinity is fine: the
+                    # clamps absorb it into [0, duration] like any other overshoot.)
+                    if ([double]::IsNaN($s0) -or [double]::IsNaN($e0)) { continue }
                     if ($e0 -lt $s0) { $t = $s0; $s0 = $e0; $e0 = $t }
-                    $s0 = [math]::Max(0.0, [math]::Min($s0, $info.duration))
-                    $e0 = [math]::Max(0.0, [math]::Min($e0, $info.duration))
+                    $s0 = [math]::Max(0.0, [math]::Min($s0, $ti.duration))
+                    $e0 = [math]::Max(0.0, [math]::Min($e0, $ti.duration))
                     if (($e0 - $s0) -lt 0.01) { continue }
-                    [void]$segs.Add(@($s0, $e0))
+                    [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0 })
                 }
             }
-            if ($segs.Count -eq 0) { [void]$segs.Add(@($a, $b)) }
-            $segs = @($segs | Sort-Object { $_[0] })
+            if ($segs.Count -eq 0) { Send-Json @{ ok = $false; error = 'Nothing is selected to save.' }; break }
+
+            # Runs of the same clip that touch end to end are one encode, not two.
             $merged = New-Object System.Collections.ArrayList
             foreach ($sg in $segs) {
-                if ($merged.Count -gt 0 -and $sg[0] -le ($merged[$merged.Count - 1][1] + 0.0005)) {
-                    if ($sg[1] -gt $merged[$merged.Count - 1][1]) { $merged[$merged.Count - 1][1] = $sg[1] }
+                $prev = $(if ($merged.Count) { $merged[$merged.Count - 1] } else { $null })
+                # Only genuinely contiguous runs merge. Parts are a SEQUENCE, not a
+                # set: one that overlaps or rewinds still contributes its own
+                # length, and folding it into its neighbour would silently drop it.
+                if ($prev -and $prev.tok -eq $sg.tok -and
+                    [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e) {
+                    $prev.e = $sg.e
                 } else {
-                    [void]$merged.Add(@($sg[0], $sg[1]))
+                    [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e })
                 }
             }
             $segs = @($merged)
 
             $span = 0.0
-            foreach ($sg in $segs) { $span += ($sg[1] - $sg[0]) }
+            foreach ($sg in $segs) { $span += ($sg.e - $sg.s) }
             if ($span -lt 0.05) { Send-Json @{ ok = $false; error = 'The selected clip is too short.' }; break }
 
-            $base = [IO.Path]::GetFileNameWithoutExtension($info.name)
-            $tag  = '{0}-{1}' -f ([timespan]::FromSeconds($segs[0][0]).ToString('hhmmss')),
-                                 ([timespan]::FromSeconds($segs[$segs.Count - 1][1]).ToString('hhmmss'))
-            $word = $(if ($segs.Count -gt 1) { 'edit' } else { 'trim' })
+            # how many distinct source files actually contribute
+            $used = @()
+            foreach ($sg in $segs) { if ($used -notcontains $sg.tok) { $used += $sg.tok } }
+            $info = $first
+            $multi = $used.Count -gt 1
+
+            $base = [IO.Path]::GetFileNameWithoutExtension($first.name)
+            # a start-end tag means nothing once the parts come from different
+            # files, so a stitched export is named by its total length instead
+            $tag  = $(if ($multi) { [timespan]::FromSeconds($span).ToString('hhmmss') }
+                      else { '{0}-{1}' -f ([timespan]::FromSeconds($segs[0].s).ToString('hhmmss')),
+                                          ([timespan]::FromSeconds($segs[$segs.Count - 1].e).ToString('hhmmss')) })
+            $word = $(if ($multi) { 'stitched' } elseif ($segs.Count -gt 1) { 'edit' } else { 'trim' })
             $dlg = New-Object System.Windows.Forms.SaveFileDialog
-            $dlg.Title            = $(if ($segs.Count -gt 1) { 'Save edited video as' } else { 'Save trimmed video as' })
+            $dlg.Title            = $(if ($multi) { 'Save stitched video as' }
+                                      elseif ($segs.Count -gt 1) { 'Save edited video as' }
+                                      else { 'Save trimmed video as' })
             $dlg.Filter           = 'MP4 video (*.mp4)|*.mp4'
             $dlg.DefaultExt       = 'mp4'
             $dlg.AddExtension     = $true
@@ -1800,8 +2237,12 @@ try {
             if ($r -ne [System.Windows.Forms.DialogResult]::OK) { Send-Json @{ cancelled = $true }; break }
 
             $outPath = $dlg.FileName
-            if ([IO.Path]::GetFullPath($outPath) -eq $info.path) {
-                Send-Json @{ ok = $false; error = 'Please save to a different file than the source video.' }
+            # ffmpeg would read and rewrite the same file at once - check every
+            # source, not just track 1's
+            $clash = $false
+            foreach ($tk in $used) { if ([IO.Path]::GetFullPath($outPath) -eq $S.Files[$tk].path) { $clash = $true } }
+            if ($clash) {
+                Send-Json @{ ok = $false; error = 'Please save to a different file than the source videos.' }
                 break
             }
 
@@ -1810,75 +2251,148 @@ try {
             $log  = Join-Path $S.CacheDir "log_$id.txt"
             $filt = ''
 
+            # Encode to a sidecar and move it into place only once ffmpeg has
+            # succeeded. -y truncates the target the moment the muxer opens, so
+            # writing straight to $outPath meant any failure - a bad codec, a
+            # cancelled job - destroyed whatever the user chose to overwrite.
+            $tmpOut = $outPath + '.svtpart'
+
+            # Some legal sources have an odd width or height (yuv422p/yuv444p
+            # H.264, VP8/VP9, MJPEG). libx264 at yuv420p refuses those outright,
+            # so round down to even whenever the source needs it.
+            $oddSrc = $false
+            foreach ($tk in $used) {
+                if (([int]$S.Files[$tk].width % 2) -or ([int]$S.Files[$tk].height % 2)) { $oddSrc = $true }
+            }
+            $evenFix = 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+
             $encArgs = @(
                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
                 '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-b:a', '192k',
                 '-movflags', '+faststart',
-                ('"' + $outPath + '"')
+                '-f', 'mp4',            # the sidecar has no .mp4 extension to infer from
+                $tmpOut
             )
 
             if ($segs.Count -eq 1) {
-                # One range: seek to it and copy forward. Unchanged from before
-                # splitting existed, and far cheaper on a long file than decoding
-                # from frame zero the way the filter path has to.
+                # One range from one file: seek to it and copy forward. Unchanged
+                # from before splitting existed, and far cheaper on a long file
+                # than decoding from frame zero the way the filter paths have to.
                 $ffArgs = @(
                     '-y', '-hide_banner', '-nostats',
-                    '-progress', ('"' + $prog + '"'),
-                    '-ss', (Num $segs[0][0] '0.###'),
-                    '-i',  ('"' + $info.path + '"'),
+                    '-progress', $prog,
+                    '-ss', (Num $segs[0].s '0.###'),
+                    '-i',  $segs[0].info.path,
                     '-t',  (Num $span '0.###'),
                     '-map', '0:v:0', '-map', '0:a:0?'
-                ) + $encArgs
+                ) + $(if ($oddSrc) { @('-vf', $evenFix) } else { @() }) + $encArgs
             } else {
-                # Several ranges: trim each one, rebase its timestamps to zero and
+                # Several parts: trim each one, rebase its timestamps to zero and
                 # concat, all in a single pass. The graph goes in a file because a
-                # dozen sections would otherwise overrun the command line that
+                # dozen parts would otherwise overrun the command line that
                 # cmd.exe accepts - see the stderr redirect below.
                 $filt = Join-Path $S.CacheDir "filter_$id.txt"
-                $sb   = New-Object Text.StringBuilder
+
+                # The concat filter refuses parts that disagree on size, aspect or
+                # pixel format, and on sample rate and layout for audio. Clips from
+                # different files essentially never agree, so when more than one
+                # file is involved every part is fitted into track 1's format:
+                # scaled to fit, letterboxed, and resampled. A single file needs
+                # none of that, so it skips the whole normalisation.
+                $tw = [int]$first.width; $th = [int]$first.height
+                $tf = [double]$first.fps
+                if ($tw -lt 2) { $tw = 2 }; if ($th -lt 2) { $th = 2 }
+                if ($tf -le 0) { $tf = 25.0 }
+                # x264 needs even dimensions for yuv420p
+                if ($tw % 2) { $tw += 1 }
+                if ($th % 2) { $th += 1 }
+                $vfit = ''
+                if ($multi) {
+                    $vfit = ",scale=${tw}:${th}:force_original_aspect_ratio=decrease" +
+                            ",pad=${tw}:${th}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=$(Num $tf '0.###')"
+                } elseif ($oddSrc) {
+                    $vfit = ",$evenFix"
+                }
+                $afit = $(if ($multi) { ',aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo' } else { '' })
+
+                # Audio only survives the concat if EVERY part offers a pin, so a
+                # clip with no sound needs silence generated to stand in for it.
+                # Each silent part gets its own lavfi input - a filter input pad
+                # cannot be consumed twice.
+                $anyAudio = $false
+                foreach ($sg in $segs) { if ($sg.info.hasAudio) { $anyAudio = $true } }
+
+                $inArgs = @()
+                $slot   = @{}          # token -> input index
+                $n      = 0
+                foreach ($tk in $used) {
+                    $slot[$tk] = $n
+                    $inArgs += @('-i', $S.Files[$tk].path)
+                    $n++
+                }
+
+                $sb = New-Object Text.StringBuilder
                 $chain = ''
                 for ($i = 0; $i -lt $segs.Count; $i++) {
-                    $s0 = Num $segs[$i][0] '0.###'
-                    $e0 = Num $segs[$i][1] '0.###'
-                    [void]$sb.Append("[0:v]trim=start=${s0}:end=${e0},setpts=PTS-STARTPTS[v$i];`n")
+                    $sg = $segs[$i]
+                    $s0 = Num $sg.s '0.###'
+                    $e0 = Num $sg.e '0.###'
+                    $ix = $slot[$sg.tok]
+                    [void]$sb.Append("[${ix}:v]trim=start=${s0}:end=${e0},setpts=PTS-STARTPTS${vfit}[v$i];`n")
                     $chain += "[v$i]"
-                    if ($info.hasAudio) {
-                        [void]$sb.Append("[0:a]atrim=start=${s0}:end=${e0},asetpts=PTS-STARTPTS[a$i];`n")
+                    if ($anyAudio) {
+                        if ($sg.info.hasAudio) {
+                            [void]$sb.Append("[${ix}:a]atrim=start=${s0}:end=${e0},asetpts=PTS-STARTPTS${afit}[a$i];`n")
+                        } else {
+                            $len = Num ($sg.e - $sg.s) '0.###'
+                            $inArgs += @('-f', 'lavfi', '-t', $len, '-i', 'anullsrc=r=48000:cl=stereo')
+                            [void]$sb.Append("[${n}:a]atrim=start=0:end=${len},asetpts=PTS-STARTPTS${afit}[a$i];`n")
+                            $n++
+                        }
                         $chain += "[a$i]"
                     }
                 }
-                if ($info.hasAudio) {
+                if ($anyAudio) {
                     [void]$sb.Append($chain + "concat=n=$($segs.Count):v=1:a=1[vout][aout]")
                 } else {
                     [void]$sb.Append($chain + "concat=n=$($segs.Count):v=1:a=0[vout]")
                 }
                 [IO.File]::WriteAllText($filt, $sb.ToString(), (New-Object Text.UTF8Encoding $false))
 
-                $mapArgs = $(if ($info.hasAudio) { @('-map', '"[vout]"', '-map', '"[aout]"') }
-                             else { @('-map', '"[vout]"', '-an') })
+                $mapArgs = $(if ($anyAudio) { @('-map', '[vout]', '-map', '[aout]') }
+                             else { @('-map', '[vout]', '-an') })
                 $ffArgs = @(
                     '-y', '-hide_banner', '-nostats',
-                    '-progress', ('"' + $prog + '"'),
-                    '-i', ('"' + $info.path + '"'),
-                    '-filter_complex_script', ('"' + $filt + '"')
+                    '-progress', $prog
+                ) + $inArgs + @(
+                    '-filter_complex_script', $filt
                 ) + $mapArgs + $encArgs
             }
             # Start-Process -PassThru never populates ExitCode, so drive the process
-            # directly. cmd handles the stderr redirect, which means no pipe to deadlock on.
-            $cmdLine = '"{0}" {1} 2>"{2}"' -f $S.FFmpeg, ($ffArgs -join ' '), $log
+            # directly. This used to go through cmd.exe purely to get the "2>" stderr
+            # redirect - but cmd expands %VAR% even inside a quoted argument, so a
+            # perfectly ordinary file like "100% done.mp4" or one sitting in a folder
+            # named %TEMP% had its path rewritten before ffmpeg ever saw it. ffmpeg is
+            # now launched directly and its stderr drained to the log ourselves, which
+            # also removes the last shell between us and the file names.
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName        = $env:ComSpec
-            $psi.Arguments       = '/c "' + $cmdLine + '"'
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow  = $true
+            $psi.FileName               = $S.FFmpeg
+            $psi.Arguments              = (($ffArgs | ForEach-Object { Quote-Arg $_ }) -join ' ')
+            $psi.UseShellExecute        = $false
+            $psi.RedirectStandardError  = $true
+            $psi.CreateNoWindow         = $true
             $proc = New-Object System.Diagnostics.Process
             $proc.StartInfo = $psi
             [void]$proc.Start()
+            # copied asynchronously so a full stderr pipe can never stall ffmpeg
+            $logFs = [IO.File]::Create($log)
+            $null = $proc.StandardError.BaseStream.CopyToAsync($logFs)
             $S.Jobs[$id] = @{
                 state = 'running'; percent = 0.0; proc = $proc; prog = $prog; log = $log
                 out = $outPath; outName = [IO.Path]::GetFileName($outPath); span = $span; error = ''
-                kind = 'save'; token = [string]$p.token; filt = $filt; parts = $segs.Count
+                kind = 'save'; token = $order[0]; filt = $filt; parts = $segs.Count
+                tmp = $tmpOut; logFs = $logFs
             }
             Send-Json @{ ok = $true; job = $id }
             break
@@ -1907,8 +2421,21 @@ try {
                 if ($job.proc.HasExited) {
                     $code = $job.proc.ExitCode
                     if ($null -eq $code) { $code = -1 }
-                    if ($code -eq 0 -and (Test-Path -LiteralPath $job.out)) {
-                        $job.state = 'done'; $job.percent = 100.0
+                    # the async stderr copy has to be closed before the log is read
+                    if ($job.logFs) {
+                        try { $job.logFs.Dispose() } catch { }
+                        $job.logFs = $null
+                    }
+                    $made = $(if ($job.tmp) { $job.tmp } else { $job.out })
+                    if ($code -eq 0 -and (Test-Path -LiteralPath $made)) {
+                        # only now does the user's chosen file get replaced
+                        $moved = $true
+                        if ($job.tmp) {
+                            try { Move-Item -LiteralPath $job.tmp -Destination $job.out -Force }
+                            catch { $moved = $false; $job.state = 'failed'
+                                    $job.error = "Could not write $($job.outName): $($_.Exception.Message)" }
+                        }
+                        if ($moved) { $job.state = 'done'; $job.percent = 100.0 }
                     } else {
                         $tail = ''
                         try {
@@ -1919,6 +2446,8 @@ try {
                         if (-not $tail) { $tail = "ffmpeg exited with code $code" }
                         $job.state = 'failed'; $job.error = $tail
                     }
+                    # a half-written sidecar must never be left lying next to the target
+                    if ($job.tmp) { Remove-Item -LiteralPath $job.tmp -Force -ErrorAction SilentlyContinue }
                     Remove-Item -LiteralPath $job.prog -Force -ErrorAction SilentlyContinue
                     Remove-Item -LiteralPath $job.log  -Force -ErrorAction SilentlyContinue
                     if ($job.filt) { Remove-Item -LiteralPath $job.filt -Force -ErrorAction SilentlyContinue }
