@@ -8,6 +8,8 @@
 #  two GUI dialogs removed so the logic can be driven headlessly:
 #
 #     Get-SvtMediaInfo      <- function Get-MediaInfo            (~line 1718)
+#     Read-SvtCrop          <- function Read-Crop                (~line 2025)
+#     Get-SvtCropFilter     <- function Get-CropFilter           (~line 2060)
 #     Resolve-SvtSegments   <- /api/save token+part validation   (~lines 2134-2182)
 #     Test-SvtOutputClash   <- /api/save "don't overwrite source" (~line 2205-2212)
 #     New-SvtExportPlan     <- /api/save arg + filter building   (~lines 2214-2321)
@@ -41,6 +43,56 @@ function Quote-SvtArg([string]$a) {
     return '"' + $a.Substring(0, $a.Length - $tail.Length) + ($tail * 2) + '"'
 }
 
+# --- app: function Read-Crop (line 2025) -------------------------------------
+function Read-SvtCrop($c) {
+    if (-not $c) { return $null }
+    $vals = @{}
+    foreach ($f in @('x', 'y', 'ow', 'oh')) {
+        $d = 0.0
+        if (-not [double]::TryParse([string]$c.$f, [Globalization.NumberStyles]::Float,
+                                    $script:Inv, [ref]$d)) { return $null }
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $null }
+        $vals[$f] = $d
+    }
+    $x = [math]::Max(0.0, [math]::Min($vals['x'], 1.0))
+    $y = [math]::Max(0.0, [math]::Min($vals['y'], 1.0))
+
+    $ow = [int][math]::Floor([math]::Round($vals['ow']) / 2) * 2
+    $oh = [int][math]::Floor([math]::Round($vals['oh']) / 2) * 2
+    if ($ow -lt 16 -or $oh -lt 16 -or $ow -gt 8192 -or $oh -gt 8192) { return $null }
+
+    @{ x = $x; y = $y; ow = $ow; oh = $oh }
+}
+
+# --- app: function Get-CropFilter (line 2060) --------------------------------
+function Get-SvtCropFilter($c, [int]$fw, [int]$fh) {
+    $mw = [int][math]::Floor($fw / 2) * 2
+    $mh = [int][math]::Floor($fh / 2) * 2
+    if ($mw -lt 2) { $mw = 2 }; if ($mh -lt 2) { $mh = 2 }
+
+    # A window bigger than the picture is shrunk to fit, and BOTH sides shrink
+    # by the same factor so a capped request keeps the shape it asked for - the
+    # client caps the same way, so the two agree even on a malformed request.
+    $cw = [int]$c.ow; $ch = [int]$c.oh
+    $k = 1.0
+    if ($cw -gt $mw) { $k = [math]::Min($k, $mw / [double]$cw) }
+    if ($ch -gt $mh) { $k = [math]::Min($k, $mh / [double]$ch) }
+    if ($k -lt 1.0) {
+        $cw = [int][math]::Floor($cw * $k / 2) * 2
+        $ch = [int][math]::Floor($ch * $k / 2) * 2
+    }
+    if ($cw -lt 2) { $cw = 2 }; if ($ch -lt 2) { $ch = 2 }
+    if ($cw -gt $mw) { $cw = $mw }; if ($ch -gt $mh) { $ch = $mh }
+
+    $cx = [int][math]::Floor($c.x * $fw / 2) * 2
+    $cy = [int][math]::Floor($c.y * $fh / 2) * 2
+    if ($cx + $cw -gt $mw) { $cx = $mw - $cw }
+    if ($cy + $ch -gt $mh) { $cy = $mh - $ch }
+    if ($cx -lt 0) { $cx = 0 }; if ($cy -lt 0) { $cy = 0 }
+
+    "crop=${cw}:${ch}:${cx}:${cy}"
+}
+
 function New-SvtState {
     param([string]$FFmpeg, [string]$FFprobe, [string]$CacheDir)
     if (-not $CacheDir) { $CacheDir = Join-Path $env:TEMP 'SimpleVideoTrimmer' }
@@ -51,6 +103,7 @@ function New-SvtState {
         CacheDir = $CacheDir
         Files    = @{}
         Jobs     = @{}
+        Audio    = @{}
     }
 }
 
@@ -101,6 +154,19 @@ function Add-SvtFile {
     return $Token
 }
 
+# Registers a soundtrack the way /api/audio/open does - only what /api/save reads.
+function Add-SvtAudio {
+    param([hashtable]$S, [string]$Path)
+    $raw = & $S.FFprobe -v error -print_format json -show_format $Path 2>$null
+    $j = ($raw -join "`n") | ConvertFrom-Json
+    $d = 0.0
+    [void][double]::TryParse([string]$j.format.duration, [Globalization.NumberStyles]::Float, $script:Inv, [ref]$d)
+    $tok = [Guid]::NewGuid().ToString('N')
+    $S.Audio[$tok] = [pscustomobject]@{ path = (Get-Item -LiteralPath $Path).FullName
+                                         name = [IO.Path]::GetFileName($Path); duration = $d }
+    return $tok
+}
+
 # =============================================================================
 #  Resolve-SvtSegments  <- /api/save lines 2134-2182
 # =============================================================================
@@ -142,7 +208,8 @@ function Resolve-SvtSegments {
             $s0 = [math]::Max(0.0, [math]::Min($s0, $ti.duration))
             $e0 = [math]::Max(0.0, [math]::Min($e0, $ti.duration))
             if (($e0 - $s0) -lt 0.01) { continue }
-            [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0 })
+            $rv = ([string]$sg.r) -in @('1', 'True', 'true')
+            [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0; r = $rv })
         }
     }
     if ($segs.Count -eq 0) { return (& $fail 'Nothing is selected to save.') }
@@ -152,10 +219,10 @@ function Resolve-SvtSegments {
     foreach ($sg in $segs) {
         $prev = $(if ($merged.Count) { $merged[$merged.Count - 1] } else { $null })
         if ($prev -and $prev.tok -eq $sg.tok -and
-            [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e) {
+            [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e -and -not $prev.r -and -not $sg.r) {
             $prev.e = $sg.e
         } else {
-            [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e })
+            [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e; r = $sg.r })
         }
     }
     $segs = @($merged)
@@ -167,8 +234,11 @@ function Resolve-SvtSegments {
     $used = @()
     foreach ($sg in $segs) { if ($used -notcontains $sg.tok) { $used += $sg.tok } }
 
+    $crop = $(if ($p.PSObject.Properties['crop']) { Read-SvtCrop $p.crop } else { $null })
+    $snd = $(if ($p.PSObject.Properties['audio'] -and $p.audio) { $S.Audio[[string]$p.audio] } else { $null })
+
     @{ ok = $true; error = ''; order = $order; first = $first; segs = $segs
-       span = $span; used = $used; multi = ($used.Count -gt 1) }
+       span = $span; used = $used; multi = ($used.Count -gt 1); crop = $crop; snd = $snd }
 }
 
 # =============================================================================
@@ -190,12 +260,16 @@ function Get-SvtDefaultOutName {
     $segs  = $Resolved.segs
     $span  = $Resolved.span
     $multi = $Resolved.multi
+    $crop  = $Resolved.crop
     $base  = [IO.Path]::GetFileNameWithoutExtension($first.name)
     $tag   = $(if ($multi) { [timespan]::FromSeconds($span).ToString('hhmmss') }
                else { '{0}-{1}' -f ([timespan]::FromSeconds($segs[0].s).ToString('hhmmss')),
                                    ([timespan]::FromSeconds($segs[$segs.Count - 1].e).ToString('hhmmss')) })
-    $word  = $(if ($multi) { 'stitched' } elseif ($segs.Count -gt 1) { 'edit' } else { 'trim' })
-    return "${base}_${word}_${tag}.mp4"
+    $word  = $(if ($crop) { 'crop' }
+               elseif ($multi) { 'stitched' }
+               elseif ($segs.Count -gt 1) { 'edit' } else { 'trim' })
+    $dim   = $(if ($crop) { '_{0}x{1}' -f $crop.ow, $crop.oh } else { '' })
+    return "${base}_${word}_${tag}${dim}.mp4"
 }
 
 # =============================================================================
@@ -213,6 +287,8 @@ function New-SvtExportPlan {
     $first = $Resolved.first
     $used  = $Resolved.used
     $multi = $Resolved.multi
+    $crop  = $Resolved.crop
+    $snd   = $Resolved.snd
 
     $prog = Join-Path $S.CacheDir "prog_$Id.txt"
     $log  = Join-Path $S.CacheDir "log_$Id.txt"
@@ -236,16 +312,25 @@ function New-SvtExportPlan {
         $tmpOut
     )
 
-    if ($segs.Count -eq 1) {
+    if ($segs.Count -eq 1 -and -not $segs[0].r) {
         $kind = 'fast'
+        $vf = ''
+        if ($crop) {
+            $vf = Get-SvtCropFilter $crop ([int]$segs[0].info.width) ([int]$segs[0].info.height)
+        } elseif ($oddSrc) {
+            $vf = $evenFix
+        }
+        $sndIn  = $(if ($snd) { @('-stream_loop', '-1', '-i', $snd.path) } else { @() })
+        $sndMap = $(if ($snd) { @('-map', '1:a:0') } else { @('-map', '0:a:0?') })
         $ffArgs = @(
             '-y', '-hide_banner', '-nostats',
             '-progress', $prog,
             '-ss', (Num $segs[0].s '0.###'),
-            '-i',  $segs[0].info.path,
+            '-i',  $segs[0].info.path
+        ) + $sndIn + @(
             '-t',  (Num $span '0.###'),
-            '-map', '0:v:0', '-map', '0:a:0?'
-        ) + $(if ($oddSrc) { @('-vf', $evenFix) } else { @() }) + $encArgs
+            '-map', '0:v:0'
+        ) + $sndMap + $(if ($vf) { @('-vf', $vf) } else { @() }) + $encArgs
     } else {
         $kind = $(if ($multi) { 'concat-multi' } else { 'concat-single' })
         $filt = Join-Path $S.CacheDir "filter_$Id.txt"
@@ -261,13 +346,14 @@ function New-SvtExportPlan {
         if ($multi) {
             $vfit = ",scale=${tw}:${th}:force_original_aspect_ratio=decrease" +
                     ",pad=${tw}:${th}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=$(Num $tf '0.###')"
-        } elseif ($oddSrc) {
+        } elseif ($oddSrc -and -not $crop) {
             $vfit = ",$evenFix"
         }
         $afit = $(if ($multi) { ',aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo' } else { '' })
 
         $anyAudio = $false
         foreach ($sg in $segs) { if ($sg.info.hasAudio) { $anyAudio = $true } }
+        if ($snd) { $anyAudio = $false }
 
         $inArgs = @()
         $slot   = @{}
@@ -285,11 +371,11 @@ function New-SvtExportPlan {
             $s0 = Num $sg.s '0.###'
             $e0 = Num $sg.e '0.###'
             $ix = $slot[$sg.tok]
-            [void]$sb.Append("[${ix}:v]trim=start=${s0}:end=${e0},setpts=PTS-STARTPTS${vfit}[v$i];`n")
+            [void]$sb.Append("[${ix}:v]trim=start=${s0}:end=${e0},setpts=PTS-STARTPTS$(if ($sg.r) { ',reverse' })${vfit}[v$i];`n")
             $chain += "[v$i]"
             if ($anyAudio) {
                 if ($sg.info.hasAudio) {
-                    [void]$sb.Append("[${ix}:a]atrim=start=${s0}:end=${e0},asetpts=PTS-STARTPTS${afit}[a$i];`n")
+                    [void]$sb.Append("[${ix}:a]atrim=start=${s0}:end=${e0},asetpts=PTS-STARTPTS$(if ($sg.r) { ',areverse' })${afit}[a$i];`n")
                 } else {
                     $len = Num ($sg.e - $sg.s) '0.###'
                     $inArgs += @('-f', 'lavfi', '-t', $len, '-i', 'anullsrc=r=48000:cl=stereo')
@@ -299,16 +385,28 @@ function New-SvtExportPlan {
                 $chain += "[a$i]"
             }
         }
+        $vend = $(if ($crop) { '[vcat]' } else { '[vout]' })
         if ($anyAudio) {
-            [void]$sb.Append($chain + "concat=n=$($segs.Count):v=1:a=1[vout][aout]")
+            [void]$sb.Append($chain + "concat=n=$($segs.Count):v=1:a=1${vend}[aout]")
         } else {
-            [void]$sb.Append($chain + "concat=n=$($segs.Count):v=1:a=0[vout]")
+            [void]$sb.Append($chain + "concat=n=$($segs.Count):v=1:a=0${vend}")
+        }
+        if ($crop) {
+            $cfw = $(if ($multi) { $tw } else { [int]$S.Files[$used[0]].width })
+            $cfh = $(if ($multi) { $th } else { [int]$S.Files[$used[0]].height })
+            [void]$sb.Append(";`n[vcat]" + (Get-SvtCropFilter $crop $cfw $cfh) + "[vout]")
         }
         $filterText = $sb.ToString()
         [IO.File]::WriteAllText($filt, $filterText, (New-Object Text.UTF8Encoding $false))
 
-        $mapArgs = $(if ($anyAudio) { @('-map', '[vout]', '-map', '[aout]') }
-                     else { @('-map', '[vout]', '-an') })
+        if ($snd) {
+            $sndIx   = $n
+            $inArgs += @('-stream_loop', '-1', '-i', $snd.path)
+            $mapArgs = @('-map', '[vout]', '-map', "${sndIx}:a:0", '-t', (Num $span '0.###'))
+        } else {
+            $mapArgs = $(if ($anyAudio) { @('-map', '[vout]', '-map', '[aout]') }
+                         else { @('-map', '[vout]', '-an') })
+        }
         $ffArgs = @(
             '-y', '-hide_banner', '-nostats',
             '-progress', $prog

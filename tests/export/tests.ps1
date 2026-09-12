@@ -76,21 +76,31 @@ foreach ($k in 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'T') {
 
 # Build the payload exactly as the server sees it: a PSCustomObject that came
 # out of ConvertFrom-Json.
-function New-Payload($Tokens, $Parts) {
+function New-Payload($Tokens, $Parts, $Crop, $Audio) {
     $o = @{}
     if ($null -ne $Tokens) { $o['tokens'] = $Tokens }
     if ($null -ne $Parts)  { $o['parts']  = $Parts }
+    if ($null -ne $Crop)   { $o['crop']   = $Crop }
+    if ($null -ne $Audio)  { $o['audio']  = $Audio }
     return (ConvertTo-Json $o -Depth 8 -Compress | ConvertFrom-Json)
+}
+# What the Advanced panel posts: a normalised offset plus the size in whole
+# source pixels, because the crop is taken 1:1 and never rescaled.
+function New-Crop([double]$x, [double]$y, [int]$ow, [int]$oh) {
+    return @{ x = $x; y = $y; ow = $ow; oh = $oh }
+}
+function New-CropJson([double]$x, [double]$y, [int]$ow, [int]$oh) {
+    return (ConvertTo-Json (New-Crop $x $y $ow $oh) -Compress | ConvertFrom-Json)
 }
 function New-RawPayload([string]$Json) { return ($Json | ConvertFrom-Json) }
 
-function Resolve-P($Tokens, $Parts) { Resolve-SvtSegments -S $St -Payload (New-Payload $Tokens $Parts) }
+function Resolve-P($Tokens, $Parts, $Crop) { Resolve-SvtSegments -S $St -Payload (New-Payload $Tokens $Parts $Crop) }
 
 function Out-Path([string]$leaf) { Join-Path $Work $leaf }
 
 # Runs a full export and returns the Invoke-SvtExport result.
-function Export-P($Tokens, $Parts, [string]$leaf) {
-    $r = Resolve-P $Tokens $Parts
+function Export-P($Tokens, $Parts, [string]$leaf, $Crop, $Audio) {
+    $r = Resolve-SvtSegments -S $St -Payload (New-Payload $Tokens $Parts $Crop $Audio)
     Assert-True $r.ok "segment resolution failed: $($r.error)"
     return (Invoke-SvtExport -S $St -Resolved $r -OutPath (Out-Path $leaf))
 }
@@ -124,8 +134,26 @@ Test-Case '[MIRROR] the load-bearing lines lib.ps1 copies are still present' {
         'force_original_aspect_ratio=decrease',
         '-filter_complex_script',
         'anullsrc=r=48000:cl=stereo',
+        'function Read-Crop',
+        'function Get-CropFilter',
+        'crop=${cw}:${ch}:${cx}:${cy}',
+        '[vcat]',
+        # the /api/save wiring: which frame each export path resolves the
+        # rectangle against is the part a refactor is most likely to get wrong
+        "`$crop = `$(if (`$p.PSObject.Properties['crop']) { Read-Crop `$p.crop } else { `$null })",
+        '$vf = Get-CropFilter $crop ([int]$segs[0].info.width) ([int]$segs[0].info.height)',
+        '$cfw = $(if ($multi) { $tw } else { [int]$S.Files[$used[0]].width })',
+        '$cfh = $(if ($multi) { $th } else { [int]$S.Files[$used[0]].height })',
         '$psi.RedirectStandardError',
-        'Quote-Arg'
+        'Quote-Arg',
+        # ping-pong: reversed parts never merge, and reverse both streams
+        '-and -not $prev.r -and -not $sg.r',
+        "PTS-STARTPTS`$(if (`$sg.r) { ',reverse' })",
+        "PTS-STARTPTS`$(if (`$sg.r) { ',areverse' })",
+        # soundtrack: looped in, the parts' own sound left out of the graph
+        "@('-stream_loop', '-1', '-i', `$snd.path)",
+        'if ($snd) { $anyAudio = $false }',
+        "`$sndMap = `$(if (`$snd) { @('-map', '1:a:0') } else { @('-map', '0:a:0?') })"
     )
     $missing = @($need | Where-Object { $txt.IndexOf($_) -lt 0 })
     Assert-Eq $missing.Count 0 ("the app changed but tests\export\lib.ps1 was not updated; missing: " +
@@ -477,6 +505,77 @@ Test-Case '[PLAN] the default save name reflects the export kind' {
 # =============================================================================
 Write-Section 'Export correctness (real ffmpeg + ffprobe)'
 # =============================================================================
+
+Test-Case '[VAL] a reversed part is never merged into its neighbour' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 2 }, @{ t = $TOK.A; s = 2; e = 4; r = 1 })
+    Assert-True $r.ok "resolution failed: $($r.error)"
+    Assert-Eq $r.segs.Count 2 'kept apart'
+    Assert-True ([bool]$r.segs[1].r) 'still reversed'
+    Assert-True (-not $r.segs[0].r) 'the forward part is not'
+}
+
+Test-Case '[EXP] ping-pong: a reversed part plays its source backwards' {
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 4 },
+                                @{ t = $TOK.A; s = 1; e = 4; r = 1 }) 'pong.mp4'
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $out = Out-Path 'pong.mp4'
+    Assert-Near (Get-VideoDuration $out) 6.0 0.3 'forward then backward'
+    $q = Resolve-FixturePixel (Get-FixturePixel $out 0.5)
+    Assert-Eq $q.Second 1 'forward pass starts in A second 1'
+    $q = Resolve-FixturePixel (Get-FixturePixel $out 3.5)
+    Assert-Eq $q.Second 3 'backward pass starts from A second 3'
+    $q = Resolve-FixturePixel (Get-FixturePixel $out 5.5)
+    Assert-Eq $q.Second 1 'and runs back down to A second 1'
+}
+
+# --- soundtrack fixtures: a short loud tone, and plain silence ----------------
+$SndTone = Join-Path $Work 'tone_0.7s.m4a'
+$SndHush = Join-Path $Work 'silence_1s.m4a'
+& (Get-FFmpegPath) -y -v error -f lavfi -i 'sine=frequency=440:duration=0.7' -c:a aac $SndTone
+& (Get-FFmpegPath) -y -v error -f lavfi -i 'anullsrc=r=48000:cl=stereo' -t 1 -c:a aac $SndHush
+$SndToneTok = Add-SvtAudio -S $St -Path $SndTone
+$SndHushTok = Add-SvtAudio -S $St -Path $SndHush
+# a fixture that has sound of its own, so replacing it can be told apart from keeping it
+$LoudKey = $null
+foreach ($k in 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'T') {
+    if ((Get-StreamInfo $FX[$k]).HasAudio) { $LoudKey = $k; break }
+}
+
+Test-Case '[VAL] an unknown soundtrack token is simply no soundtrack' {
+    $r = Resolve-SvtSegments -S $St -Payload (New-Payload @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 2 }) $null 'nope')
+    Assert-True $r.ok "resolution failed: $($r.error)"
+    Assert-True ($null -eq $r.snd) 'no soundtrack'
+}
+
+Test-Case '[EXP] a soundtrack replaces the clip''s own sound completely' {
+    Assert-True ($null -ne $LoudKey) 'need a fixture with its own audio to test replacement'
+    $orig = Get-MeanVolumeDb $FX[$LoudKey] 0.5 1.5
+    Assert-True ($orig -gt -60) "the fixture itself is audible ($orig dB)"
+    $res = Export-P @($TOK[$LoudKey]) @(@{ t = $TOK[$LoudKey]; s = 0.5; e = 2.5 }) 'snd_replace.mp4' $null $SndHushTok
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $vol = Get-MeanVolumeDb (Out-Path 'snd_replace.mp4') 0 2
+    Assert-True ($null -ne $vol) 'the output has an audio track'
+    Assert-True ($vol -lt -60) "only the (silent) soundtrack is heard, not the clip: $vol dB"
+}
+
+Test-Case '[EXP] a short soundtrack repeats to the end and stops with the picture (one part)' {
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 3 }) 'snd_loop_fast.mp4' $null $SndToneTok
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $out = Out-Path 'snd_loop_fast.mp4'
+    Assert-Near (Get-VideoDuration $out) 3.0 0.15 'no longer than the video'
+    $late = Get-MeanVolumeDb $out 2.2 0.5
+    Assert-True ($late -gt -40) "the 0.7s tone is still playing 2.2s in, so it looped: $late dB"
+}
+
+Test-Case '[EXP] a short soundtrack repeats across a stitched, multi-part export' {
+    $res = Export-P @($TOK.A, $TOK.B) @(@{ t = $TOK.A; s = 0; e = 1.5 }, @{ t = $TOK.B; s = 1; e = 2.5 }) 'snd_loop_multi.mp4' $null $SndToneTok
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $out = Out-Path 'snd_loop_multi.mp4'
+    Assert-Near (Get-VideoDuration $out) 3.0 0.2 'no longer than the video'
+    Assert-True ((Get-StreamInfo $out).HasAudio) 'the output has sound'
+    $late = Get-MeanVolumeDb $out 2.3 0.5
+    Assert-True ($late -gt -40) "still sounding at the end: $late dB"
+}
 
 Test-Case '[EXP] fast path produces the requested duration' {
     $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1.5; e = 4.5 }) 'fast_dur.mp4'
@@ -953,6 +1052,375 @@ Test-Case '[ROB] two concurrent exports do not collide in the cache dir' {
     }
     Assert-Near (Get-VideoDuration (Out-Path 'cc1.mp4')) 2.0 0.2 'job 1 duration'
     Assert-Near (Get-VideoDuration (Out-Path 'cc2.mp4')) 2.0 0.2 'job 2 duration'
+}
+
+# =============================================================================
+Write-Section 'Crop and output size - reading the request'
+# =============================================================================
+#  Read-Crop is the only thing standing between a browser (or anything else
+#  that can POST) and a filter string handed straight to ffmpeg, so it gets the
+#  same treatment the part list does: anything it cannot make sense of turns
+#  into NO crop, never into a half-built rectangle.
+# =============================================================================
+
+Test-Case '[CROP] a well-formed request is accepted as sent' {
+    $c = Read-SvtCrop (New-CropJson 0.25 0.1 512 512)
+    Assert-True ($null -ne $c) 'should be accepted'
+    Assert-Near $c.x 0.25 0.0001 'x'
+    Assert-Near $c.y 0.1  0.0001 'y'
+    Assert-Eq   $c.ow 512 'ow'
+    Assert-Eq   $c.oh 512 'oh'
+}
+
+Test-Case '[CROP] a missing field means no crop, not a partial one' {
+    foreach ($drop in 'x', 'y', 'ow', 'oh') {
+        $h = @{ x = 0.1; y = 0.1; ow = 512; oh = 512 }
+        $h.Remove($drop)
+        $c = Read-SvtCrop (ConvertTo-Json $h -Compress | ConvertFrom-Json)
+        Assert-True ($null -eq $c) "dropping '$drop' should have produced no crop"
+    }
+}
+
+Test-Case '[CROP] NaN, infinity and plain nonsense are refused' {
+    foreach ($bad in '"NaN"', '"Infinity"', '"-Infinity"', '"left"', '""', 'null') {
+        $json = '{"x":' + $bad + ',"y":0,"ow":512,"oh":512}'
+        Assert-True ($null -eq (Read-SvtCrop ($json | ConvertFrom-Json))) "x=$bad should have produced no crop"
+    }
+}
+
+Test-Case '[CROP] an absurd or tiny size is refused' {
+    Assert-True ($null -eq (Read-SvtCrop (New-CropJson 0 0 8 512))     ) 'ow below 16'
+    Assert-True ($null -eq (Read-SvtCrop (New-CropJson 0 0 512 8))     ) 'oh below 16'
+    Assert-True ($null -eq (Read-SvtCrop (New-CropJson 0 0 99999 512)) ) 'ow above the ceiling'
+    Assert-True ($null -eq (Read-SvtCrop (New-CropJson 0 0 512 99999)) ) 'oh above the ceiling'
+}
+
+Test-Case '[CROP] an odd size is rounded down to even, never left odd' {
+    # x264 at yuv420p refuses an odd dimension outright, and rounding DOWN
+    # matters as much as rounding: up would claim a pixel column the source
+    # might not have.
+    $c = Read-SvtCrop (New-CropJson 0 0 683 385)
+    Assert-Eq $c.ow 682 'ow floored to even'
+    Assert-Eq $c.oh 384 'oh floored to even'
+}
+
+Test-Case '[CROP] an out-of-range offset is clamped into the frame' {
+    $c = Read-SvtCrop (New-CropJson -0.4 -1.0 512 512)
+    Assert-Near $c.x 0 0.0001 'negative x clamped to 0'
+    Assert-Near $c.y 0 0.0001 'negative y clamped to 0'
+    $d = Read-SvtCrop (New-CropJson 4.0 9.0 512 512)
+    Assert-Near $d.x 1 0.0001 'x past the far edge clamped to 1'
+    Assert-Near $d.y 1 0.0001 'y past the far edge clamped to 1'
+}
+
+# =============================================================================
+Write-Section 'Crop and output size - the filter it builds'
+# =============================================================================
+
+Test-Case '[CROP] the window is placed in whole even pixels and never scaled' {
+    # 640x360 source, a 320x180 window a quarter of the way in.
+    $f = Get-SvtCropFilter (Read-SvtCrop (New-CropJson 0.25 0.25 320 180)) 640 360
+    Assert-Eq $f 'crop=320:180:160:90' 'filter text'
+    Assert-True ($f.IndexOf('scale=') -lt 0) 'a crop must not carry a scale'
+}
+
+Test-Case '[CROP] the requested size is taken out of the source 1:1' {
+    # The whole point of the feature: ask for 512x512 of a 1920x1080 picture and
+    # that is exactly the window, wherever it sits and whatever else is on.
+    foreach ($px in 256, 512, 768, 1024) {
+        $f = Get-SvtCropFilter (Read-SvtCrop (New-CropJson 0.1 0.0 $px $px)) 1920 1080
+        $m = [regex]::Match($f, '^crop=(\d+):(\d+):')
+        Assert-Eq ([int]$m.Groups[1].Value) $px "width at budget $px"
+        Assert-Eq ([int]$m.Groups[2].Value) $px "height at budget $px"
+    }
+}
+
+Test-Case '[CROP] a window bigger than the source is shrunk, never upscaled' {
+    # 1024 square asked for out of a 640x360 clip: take the biggest square that
+    # is actually there. Both sides shrink together, so a capped window keeps
+    # the shape it asked for instead of quietly turning into the whole frame.
+    $f = Get-SvtCropFilter (Read-SvtCrop (New-CropJson 0 0 1024 1024)) 640 360
+    $m = [regex]::Match($f, '^crop=(\d+):(\d+):(\d+):(\d+)$')
+    Assert-True $m.Success "unparseable filter: $f"
+    Assert-Eq ([int]$m.Groups[1].Value) 360 'width shrunk with the height, keeping it square'
+    Assert-Eq ([int]$m.Groups[2].Value) 360 'height capped at the source height'
+    Assert-True ($f.IndexOf('scale=') -lt 0) 'and still no scaling'
+
+    # a wide window against the same clip caps on width and keeps its own shape
+    $g = Get-SvtCropFilter (Read-SvtCrop (New-CropJson 0 0 1280 720)) 640 360
+    $m2 = [regex]::Match($g, '^crop=(\d+):(\d+):')
+    Assert-Eq ([int]$m2.Groups[1].Value) 640 '16:9 window capped at the full width'
+    Assert-Eq ([int]$m2.Groups[2].Value) 360 'and the full height, still 16:9'
+}
+
+Test-Case '[CROP] every number the crop filter emits is even' {
+    # An odd crop offset falls between chroma samples on yuv420p. Sweep awkward
+    # offsets and sizes against an odd frame and insist on even throughout.
+    foreach ($x in 0.0, 0.13, 0.37, 0.5, 0.71, 0.99) {
+        foreach ($px in 16, 100, 256, 333, 640, 1024) {
+            $c = Read-SvtCrop (New-CropJson $x $x $px $px)
+            if ($null -eq $c) { continue }
+            $f = Get-SvtCropFilter $c 641 361
+            $m = [regex]::Match($f, '^crop=(\d+):(\d+):(\d+):(\d+)$')
+            Assert-True $m.Success "unparseable filter: $f"
+            for ($g = 1; $g -le 4; $g++) {
+                Assert-Eq ([int]$m.Groups[$g].Value % 2) 0 "group $g of '$f' is odd"
+            }
+        }
+    }
+}
+
+Test-Case '[CROP] the window can never run off the frame it is resolved against' {
+    foreach ($x in 0.0, 0.34, 0.66, 0.99, 1.0) {
+        foreach ($px in 16, 128, 360, 640, 1024, 4096) {
+            $c = Read-SvtCrop (New-CropJson $x $x $px $px)
+            if ($null -eq $c) { continue }
+            $f = Get-SvtCropFilter $c 641 361
+            $m = [regex]::Match($f, '^crop=(\d+):(\d+):(\d+):(\d+)$')
+            $cw = [int]$m.Groups[1].Value; $ch = [int]$m.Groups[2].Value
+            $cx = [int]$m.Groups[3].Value; $cy = [int]$m.Groups[4].Value
+            Assert-True (($cx + $cw) -le 640) "x+w = $($cx+$cw) runs past the even width 640 ($f)"
+            Assert-True (($cy + $ch) -le 360) "y+h = $($cy+$ch) runs past the even height 360 ($f)"
+            Assert-True ($cw -ge 2 -and $ch -ge 2) "degenerate window ($f)"
+        }
+    }
+}
+
+Test-Case '[CROP] the fast path crops the source and leaves it at that size' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3 }) (New-Crop 0.5 0 320 180)
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'crop_plan.mp4')
+    Assert-Eq $plan.kind 'fast' 'one part from one file still takes the fast path'
+    $i = [array]::IndexOf($plan.ffArgs, '-vf')
+    Assert-True ($i -ge 0) 'a -vf was expected'
+    Assert-Eq $plan.ffArgs[$i + 1] 'crop=320:180:320:0' 'the filter'
+}
+
+Test-Case '[CROP] an odd-sized source is made even by the crop itself' {
+    # Fixture E is 641x361. crop only ever emits even numbers, so it already
+    # satisfies what the even-up existed to guarantee.
+    $r = Resolve-P @($TOK.E) @(@{ t = $TOK.E; s = 0; e = 2 }) (New-Crop 0 0 640 360)
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'crop_odd.mp4')
+    $i = [array]::IndexOf($plan.ffArgs, '-vf')
+    Assert-True ($i -ge 0) 'a -vf was expected'
+    Assert-True ($plan.ffArgs[$i + 1].IndexOf('trunc(iw/2)') -lt 0) 'the even-up should be gone'
+    Assert-Eq $plan.ffArgs[$i + 1] 'crop=640:360:0:0' 'the filter'
+}
+
+Test-Case '[CROP] several parts are concatenated first and cropped once' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 1 }, @{ t = $TOK.A; s = 3; e = 4 }) `
+                   (New-Crop 0 0 320 180)
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'crop_concat.mp4')
+    Assert-Eq $plan.kind 'concat-single' 'two parts from one file'
+    Assert-True ($plan.filterText.IndexOf('[vcat]crop=320:180:0:0[vout]') -ge 0) `
+                "the crop should sit after the concat; got: $($plan.filterText)"
+    # one crop for the whole programme, not one per part
+    Assert-Eq ([regex]::Matches($plan.filterText, 'crop=').Count) 1 'exactly one crop filter'
+}
+
+Test-Case '[CROP] a stitched export crops the canvas the tracks were fitted into' {
+    # A is 640x360 and B is 480x360; B is letterboxed into A's frame, so the
+    # crop has to be measured against A - anything else would cut a different
+    # part of the picture than the one the overlay drew.
+    $r = Resolve-P @($TOK.A, $TOK.B) @(@{ t = $TOK.A; s = 0; e = 1 }, @{ t = $TOK.B; s = 0; e = 1 }) `
+                   (New-Crop 0.25 0.25 320 180)
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'crop_stitch.mp4')
+    Assert-Eq $plan.kind 'concat-multi' 'two files'
+    Assert-True ($plan.filterText.IndexOf('[vcat]crop=320:180:160:90[vout]') -ge 0) `
+                "expected the crop on track 1's 640x360 canvas; got: $($plan.filterText)"
+}
+
+Test-Case '[CROP] a save with no crop builds exactly the command it always did' {
+    # The whole feature has to be invisible to anyone who never opens the panel.
+    $parts = @(@{ t = $TOK.A; s = 1; e = 3 })
+    $bare  = New-SvtExportPlan -S $St -Resolved (Resolve-P @($TOK.A) $parts) `
+                               -OutPath (Out-Path 'nocrop.mp4') -Id 'fixedid'
+    $again = New-SvtExportPlan -S $St -Resolved (Resolve-P @($TOK.A) $parts $null) `
+                               -OutPath (Out-Path 'nocrop.mp4') -Id 'fixedid'
+    Assert-Eq $again.cmdLine $bare.cmdLine 'an explicit null crop must change nothing'
+    Assert-True ($bare.cmdLine.IndexOf('crop=') -lt 0) 'no crop filter without a crop'
+}
+
+Test-Case '[CROP] the suggested file name carries the size it was cropped to' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3 }) (New-Crop 0 0 512 512)
+    $n = Get-SvtDefaultOutName $r
+    Assert-True ($n.IndexOf('_crop_') -ge 0) "expected a crop tag in '$n'"
+    Assert-True ($n.IndexOf('_512x512.mp4') -ge 0) "expected the size in '$n'"
+}
+
+# =============================================================================
+Write-Section 'Crop - the app''s own code, not the copy of it'
+# =============================================================================
+#  Every other test on this page runs lib.ps1, which is a HAND COPY. These two
+#  lift Read-Crop and Get-CropFilter straight out of SimpleVideoTrimmer.bat,
+#  run them side by side with the copy, and insist the answers match. That is
+#  the one check here that can catch the mirror having quietly drifted.
+# =============================================================================
+
+# Pulls a named function out of the app source by matching its braces, and
+# defines it under a new name so it can be called next to the mirror's version.
+function Import-AppFunction {
+    param([string]$Text, [string]$Name, [string]$As)
+    $sig = "function $Name("
+    $i = $Text.IndexOf($sig)
+    if ($i -lt 0) { throw "the app no longer defines '$Name' - update tests\export\lib.ps1" }
+    $open = $Text.IndexOf('{', $i)
+    if ($open -lt 0) { throw "no body found for '$Name'" }
+    $depth = 0
+    for ($j = $open; $j -lt $Text.Length; $j++) {
+        if ($Text[$j] -eq '{') { $depth++ }
+        elseif ($Text[$j] -eq '}') { $depth--; if ($depth -eq 0) { break } }
+    }
+    if ($depth -ne 0) { throw "unbalanced braces reading '$Name' out of the app" }
+    # $sig already swallowed the opening bracket, so $header still carries the
+    # closing one - do not add a second
+    $header = $Text.Substring($i + $sig.Length, $open - ($i + $sig.Length)).TrimEnd()
+    $body   = $Text.Substring($open, $j - $open + 1)
+    Invoke-Expression "function script:$As($header $body"
+}
+
+Test-Case '[MIRROR] the app''s own Read-Crop agrees with the copy of it' {
+    $txt = [IO.File]::ReadAllText($AppPath)
+    Import-AppFunction -Text $txt -Name 'Read-Crop' -As 'App-ReadCrop'
+    $inv = [cultureinfo]::InvariantCulture     # the app's handler supplies this
+
+    $cases = @(
+        '{"x":0.25,"y":0.1,"ow":512,"oh":512}'
+        '{"x":0,"y":0,"ow":682,"oh":384}'
+        '{"x":0.9,"y":0.95,"ow":512,"oh":512}'
+        '{"x":-0.4,"y":-1,"ow":512,"oh":512}'
+        '{"x":4,"y":9,"ow":512,"oh":512}'
+        '{"x":0,"y":0,"ow":683,"oh":385}'
+        '{"x":0,"y":0,"ow":8,"oh":512}'
+        '{"x":0,"y":0,"ow":99999,"oh":512}'
+        '{"x":0,"y":0,"ow":1024,"oh":1024}'
+        '{"x":"NaN","y":0,"ow":512,"oh":512}'
+        '{"x":"Infinity","y":0,"ow":512,"oh":512}'
+        '{"x":"left","y":0,"ow":512,"oh":512}'
+        '{"y":0,"ow":512,"oh":512}'
+        '{"x":0.33,"y":0.66,"ow":256,"oh":144}'
+    )
+    foreach ($json in $cases) {
+        $in   = $json | ConvertFrom-Json
+        $app  = App-ReadCrop $in
+        $copy = Read-SvtCrop $in
+        if ($null -eq $app -or $null -eq $copy) {
+            Assert-True (($null -eq $app) -and ($null -eq $copy)) `
+                        "one refused and the other did not, for $json"
+            continue
+        }
+        foreach ($k in 'x', 'y', 'ow', 'oh') {
+            Assert-Eq $app[$k] $copy[$k] "field '$k' differs for $json"
+        }
+    }
+}
+
+Test-Case '[MIRROR] the app''s own Get-CropFilter agrees with the copy of it' {
+    $txt = [IO.File]::ReadAllText($AppPath)
+    Import-AppFunction -Text $txt -Name 'Read-Crop'      -As 'App-ReadCrop2'
+    Import-AppFunction -Text $txt -Name 'Get-CropFilter' -As 'App-GetCropFilter'
+    $inv = [cultureinfo]::InvariantCulture
+
+    # every shape of frame the two export paths can hand it, odd sizes included
+    $frames = @(@(640, 360), @(641, 361), @(1920, 1080), @(480, 360), @(2, 2))
+    $n = 0
+    foreach ($fr in $frames) {
+        foreach ($x in 0.0, 0.17, 0.5, 0.83, 1.0) {
+            foreach ($px in 16, 180, 256, 512, 1024, 4096) {
+                $json = ('{{"x":{0},"y":{1},"ow":{2},"oh":{2}}}' -f $x, $x, $px)
+                $in = $json | ConvertFrom-Json
+                $c  = App-ReadCrop2 $in
+                if ($null -eq $c) { continue }
+                $n++
+                Assert-Eq (App-GetCropFilter $c $fr[0] $fr[1]) `
+                          (Get-SvtCropFilter (Read-SvtCrop $in) $fr[0] $fr[1]) `
+                          "filter differs for $json on a $($fr[0])x$($fr[1]) frame"
+            }
+        }
+    }
+    Assert-True ($n -ge 60) "only $n combinations were actually compared"
+}
+
+# =============================================================================
+Write-Section 'Crop and output size - what actually comes out'
+# =============================================================================
+
+Test-Case '[CROP] the exported file really is the size that was asked for' {
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3 }) 'crop_size.mp4' (New-Crop 0.25 0.25 320 180)
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $info = Get-StreamInfo (Out-Path 'crop_size.mp4')
+    Assert-Eq $info.Width  320 'output width'
+    Assert-Eq $info.Height 180 'output height'
+}
+
+Test-Case '[CROP] a square crop of a 16:9 source really comes out square' {
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3 }) 'crop_square.mp4' (New-Crop 0.25 0 360 360)
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $info = Get-StreamInfo (Out-Path 'crop_square.mp4')
+    Assert-Eq $info.Width  360 'output width'
+    Assert-Eq $info.Height 360 'output height'
+}
+
+Test-Case '[CROP] asking for more pixels than the clip has never upscales it' {
+    # A is 640x360. Ask for a 1024x1024 square and the export has to come back
+    # 360x360 - the most that was actually there - not a blown-up 1024.
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3 }) 'crop_cap.mp4' (New-Crop 0 0 1024 1024)
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $info = Get-StreamInfo (Out-Path 'crop_cap.mp4')
+    Assert-Eq $info.Width  360 'width capped at the source height, not upscaled'
+    Assert-Eq $info.Height 360 'height capped at the source height'
+}
+
+Test-Case '[CROP] the crop keeps the part of the picture it was pointed at' {
+    # Every fixture is a flat colour except for a white-on-black counter drawn
+    # into the BOTTOM LEFT. That burnt-in mark is the only thing that tells one
+    # corner from another, so it is what proves the offsets are not transposed,
+    # mirrored, or quietly ignored.
+    $tr = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 3 }) 'crop_tr.mp4' (New-Crop 0.5 0   320 180)
+    Assert-Eq $tr.state 'done' "top-right export failed: $($tr.error)"
+    $bl = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 3 }) 'crop_bl.mp4' (New-Crop 0   0.5 320 180)
+    Assert-Eq $bl.state 'done' "bottom-left export failed: $($bl.error)"
+
+    # Sample the corner the counter should have landed in rather than the whole
+    # frame: averaged over all 256x144 the mark is only a few units of green,
+    # which is too thin a margin to call a regression on.
+    $rgbTR = Get-RegionRgb -Path (Out-Path 'crop_tr.mp4') -At 1.5 -W 160 -H 80 -X 0 -Y 100
+    $rgbBL = Get-RegionRgb -Path (Out-Path 'crop_bl.mp4') -At 1.5 -W 160 -H 80 -X 0 -Y 100
+
+    # A is the red family, so green and blue sit at zero everywhere except where
+    # the white-on-black counter is burnt in. That makes green the clean tell -
+    # red is not, because white text lifts it just as the black box lowers it.
+    Assert-True ($rgbTR.G -le 4)  "the top-right quadrant should hold no counter (G=$($rgbTR.G))"
+    Assert-True ($rgbBL.G -ge 15) "the bottom-left quadrant should hold the counter (G=$($rgbBL.G))"
+    Assert-True ($rgbBL.B -ge 15) "the counter is white, so blue should rise with green (B=$($rgbBL.B))"
+    Assert-True ($rgbBL.G -gt $rgbTR.G * 3 + 10) `
+                "the two quadrants should look plainly different (TR G=$($rgbTR.G), BL G=$($rgbBL.G))"
+}
+
+Test-Case '[CROP] a cropped stitch encodes, and every part lands at one size' {
+    $res = Export-P @($TOK.A, $TOK.B) `
+                    @(@{ t = $TOK.A; s = 0; e = 1.5 }, @{ t = $TOK.B; s = 0; e = 1.5 }) `
+                    'crop_stitched.mp4' (New-Crop 0.1 0.1 512 288)
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $info = Get-StreamInfo (Out-Path 'crop_stitched.mp4')
+    Assert-Eq $info.Width  512 'output width'
+    Assert-Eq $info.Height 288 'output height'
+    Assert-Near (Get-VideoDuration (Out-Path 'crop_stitched.mp4')) 3.0 0.35 'both parts survived'
+}
+
+Test-Case '[CROP] an odd-sized source crops and encodes without complaint' {
+    $res = Export-P @($TOK.E) @(@{ t = $TOK.E; s = 0; e = 2 }) 'crop_odd_out.mp4' (New-Crop 0 0 320 180)
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $info = Get-StreamInfo (Out-Path 'crop_odd_out.mp4')
+    Assert-Eq $info.Width  320 'output width'
+    Assert-Eq $info.Height 180 'output height'
+}
+
+Test-Case '[CROP] audio is untouched by a crop' {
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3 }) 'crop_audio.mp4' (New-Crop 0 0 320 180)
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $db = Get-MeanVolumeDb -Path (Out-Path 'crop_audio.mp4')
+    Assert-True ($null -ne $db) 'the crop should not have dropped the audio track'
+    Assert-True ($db -gt -60) "the tone should still be audible (mean $db dB)"
 }
 
 # ------------------------------------------------------------- summary ------

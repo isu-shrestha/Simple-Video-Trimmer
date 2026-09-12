@@ -93,6 +93,13 @@ if (typeof JSON === "undefined") {
   };
 }
 
+/* The JScript host predates JSON.parse. Tests use it to read back what the app
+   would have POSTed; the only input is a body the app itself just built, so
+   eval is enough and nothing in the shipping source relies on it. */
+if (typeof JSON !== "undefined" && !JSON.parse) {
+  JSON.parse = function (s) { return eval("(" + String(s) + ")"); };
+}
+
 /* -------------------------------- output --------------------------------- */
 function say(s) { WScript.Echo(String(s)); }
 
@@ -197,7 +204,7 @@ var FAKE = {
   byId: {},
   created: [],
   el: function (id) {
-    if (!this.byId[id]) this.byId[id] = new FakeEl(id === "v" ? "VIDEO" : "DIV", id);
+    if (!this.byId[id]) this.byId[id] = new FakeEl(id === "v" || id === "v2" ? "VIDEO" : "DIV", id);
     return this.byId[id];
   },
   reset: function () { this.created = []; }
@@ -248,6 +255,9 @@ function makeTimer(fn, ms, repeat) {
 function cancelTimer(id) {
   for (var i = 0; i < TIMERS.length; i++) if (TIMERS[i].id === id) TIMERS[i].cancelled = true;
 }
+/* animation frames: recorded like timers, fired by hand */
+function requestAnimationFrame(fn) { return makeTimer(fn, 16, false); }
+function cancelAnimationFrame(id) { cancelTimer(id); }
 function setTimeout(fn, ms) { return makeTimer(fn, ms, false); }
 function clearTimeout(id) { cancelTimer(id); }
 function setInterval(fn, ms) { return makeTimer(fn, ms, true); }
