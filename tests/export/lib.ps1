@@ -209,7 +209,9 @@ function Resolve-SvtSegments {
             $e0 = [math]::Max(0.0, [math]::Min($e0, $ti.duration))
             if (($e0 - $s0) -lt 0.01) { continue }
             $rv = ([string]$sg.r) -in @('1', 'True', 'true')
-            [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0; r = $rv })
+            # m marks a part whose track is muted - it goes out silent
+            $mu = ([string]$sg.m) -in @('1', 'True', 'true')
+            [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0; r = $rv; m = $mu })
         }
     }
     if ($segs.Count -eq 0) { return (& $fail 'Nothing is selected to save.') }
@@ -219,10 +221,11 @@ function Resolve-SvtSegments {
     foreach ($sg in $segs) {
         $prev = $(if ($merged.Count) { $merged[$merged.Count - 1] } else { $null })
         if ($prev -and $prev.tok -eq $sg.tok -and
-            [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e -and -not $prev.r -and -not $sg.r) {
+            [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e -and -not $prev.r -and -not $sg.r -and
+            $prev.m -eq $sg.m) {
             $prev.e = $sg.e
         } else {
-            [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e; r = $sg.r })
+            [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e; r = $sg.r; m = $sg.m })
         }
     }
     $segs = @($merged)
@@ -321,7 +324,9 @@ function New-SvtExportPlan {
             $vf = $evenFix
         }
         $sndIn  = $(if ($snd) { @('-stream_loop', '-1', '-i', $snd.path) } else { @() })
-        $sndMap = $(if ($snd) { @('-map', '1:a:0') } else { @('-map', '0:a:0?') })
+        $sndMap = $(if ($snd) { @('-map', '1:a:0') }
+                    elseif ($segs[0].m) { @('-an') }
+                    else { @('-map', '0:a:0?') })
         $ffArgs = @(
             '-y', '-hide_banner', '-nostats',
             '-progress', $prog,
@@ -352,7 +357,7 @@ function New-SvtExportPlan {
         $afit = $(if ($multi) { ',aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo' } else { '' })
 
         $anyAudio = $false
-        foreach ($sg in $segs) { if ($sg.info.hasAudio) { $anyAudio = $true } }
+        foreach ($sg in $segs) { if ($sg.info.hasAudio -and -not $sg.m) { $anyAudio = $true } }
         if ($snd) { $anyAudio = $false }
 
         $inArgs = @()
@@ -374,7 +379,7 @@ function New-SvtExportPlan {
             [void]$sb.Append("[${ix}:v]trim=start=${s0}:end=${e0},setpts=PTS-STARTPTS$(if ($sg.r) { ',reverse' })${vfit}[v$i];`n")
             $chain += "[v$i]"
             if ($anyAudio) {
-                if ($sg.info.hasAudio) {
+                if ($sg.info.hasAudio -and -not $sg.m) {
                     [void]$sb.Append("[${ix}:a]atrim=start=${s0}:end=${e0},asetpts=PTS-STARTPTS$(if ($sg.r) { ',areverse' })${afit}[a$i];`n")
                 } else {
                     $len = Num ($sg.e - $sg.s) '0.###'

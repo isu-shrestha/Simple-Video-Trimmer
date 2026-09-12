@@ -339,6 +339,7 @@ $S.Html = @'
   .tk button svg{width:13px;height:13px}
   .tk button:hover:not(:disabled){background:#243040;border-color:#3b4a5c}
   .tk button.rm:hover:not(:disabled){background:#341d1c;border-color:#96413d;color:#ff9d96}
+  .tk button.mute.on{color:var(--warn);background:#2e2617;border-color:#5c4a24}
   /* line three: how many times the track plays, and whether it bounces */
   .tkloop{display:flex;align-items:center;gap:5px;width:100%;font-size:11px;color:#6c7986}
   .tkloop select{font:11px/1 "Consolas",monospace;color:var(--text);background:#161b22;
@@ -824,7 +825,9 @@ function keptRanges(){
    time and kept separate across joins so the encoder concatenates them in order */
 function keptParts(){
   return expandLoops(keptPartsOnce(), function(p){ return trackByTok(p.t); },
-                     function(p){ return { t: p.t, s: p.s, e: p.e, r: 1 }; });
+                     function(p){ var q = { t: p.t, s: p.s, e: p.e, r: 1 };
+                                  if (p.m) q.m = 1;
+                                  return q; });
 }
 function trackByTok(tok){
   for (var i = 0; i < TR.length; i++) if (TR[i].token === tok) return TR[i];
@@ -857,9 +860,13 @@ function keptPartsOnce(){
     var k = trackAt((s + e) / 2);
     if (k < 0) continue;
     var o = trackOff(k);
-    out.push({ t: TR[k].token,
-               s: +clamp(s - o, 0, TR[k].dur).toFixed(6),
-               e: +clamp(e - o, 0, TR[k].dur).toFixed(6) });
+    var part = { t: TR[k].token,
+                 s: +clamp(s - o, 0, TR[k].dur).toFixed(6),
+                 e: +clamp(e - o, 0, TR[k].dur).toFixed(6) };
+    /* only muted parts carry the flag, so a save that mutes nothing posts
+       exactly the same body it always did */
+    if (TR[k].mute) part.m = 1;
+    out.push(part);
   }
   return out;
 }
@@ -884,7 +891,7 @@ function snapshot(withTrim){
     order: TR.slice(),
     edits: TR.map(function(t){
       return { o: t, cuts: t.cuts.slice(), dels: t.dels.map(function(r){ return r.slice(); }),
-               loops: t.loops, pong: t.pong };
+               loops: t.loops, pong: t.pong, mute: t.mute };
     }),
     sel: selSeg, A: A, B: B, ab: !!withTrim
   });
@@ -1177,6 +1184,7 @@ function acceptTrack(j, quiet){
   j.dels = [];
   j.loops = 1;
   j.pong = false;
+  j.mute = false;
   TR.push(j);
   recalc();
   if (first){ A = 0; B = D; }
@@ -1378,6 +1386,9 @@ document.addEventListener("pointercancel", endTkDrag);
 function renderTracks(){
   /* a join crossed mid-drag would rebuild the rows out from under the pointer */
   if (tkDrag && tkDrag.on) return;
+  /* every change of the current track, and every mute toggle, comes through
+     here - so this is the one place the players have to be told about */
+  applyMute();
   var host = $("tkList");
   /* The rows are rebuilt from scratch. Emptying the list collapses it, which
      throws its scroll back to the top, and the control just used is thrown away
@@ -1456,6 +1467,21 @@ function trackRow(i){
 
   foot.appendChild(mini("Jump to the start of this track",
     '<path d="M4 11h9V7.5L18 12l-5 4.5V13H4z"/>', "", function(){ playbackPause(); seek(trackOff(i)); }));
+  /* A track with no sound of its own has nothing to mute, and a soundtrack has
+     already replaced every track's sound, so the button would be a lie. */
+  var sndOn = !!SND, quiet = !t.hasAudio;
+  foot.appendChild(mini(
+    sndOn ? "The soundtrack has replaced this track's sound"
+          : quiet ? "This track has no sound"
+          : t.mute ? "This track is muted - click to hear it again"
+                   : "Mute this track's sound",
+    t.mute || sndOn || quiet
+      ? '<path d="M3 9v6h4l5 5V4L7 9H3z"/><path d="M21.2 8.2 19.8 6.8 17 9.6l-2.8-2.8-1.4 1.4L15.6 11l-2.8 2.8 1.4 1.4L17 12.4l2.8 2.8 1.4-1.4L18.4 11z"/>'
+      : '<path d="M3 9v6h4l5 5V4L7 9H3z"/><path d="M14.5 8.5a4 4 0 0 1 0 7v-7zM16.5 5a7.5 7.5 0 0 1 0 14v-2a5.5 5.5 0 0 0 0-10V5z"/>',
+    "mute" + (t.mute && !sndOn && !quiet ? " on" : ""),
+    function(){ setMute(i, !TR[i].mute); },
+    sndOn || quiet));
+
   foot.appendChild(mini("Clone this track - splits, deletions and loops included - to use again later",
     '<path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/>',
     "", function(){ cloneTrack(i); }));
@@ -1515,8 +1541,13 @@ function setLoops(i, n){
 var SND = null;          /* { token, name, path, dur } */
 var userMuted = false;   /* the mute button - under a soundtrack it mutes that */
 
+/* Three things can silence the picture: a soundtrack (which replaces every
+   track's own sound), the volume bar's mute, and the track's own mute button.
+   Only the second reaches a soundtrack - muting one track must not silence
+   music that plays over the whole program. */
+function trackMuted(){ return cur >= 0 && cur < TR.length && !!TR[cur].mute; }
 function applyMute(){
-  vMain.muted = vAux.muted = SND ? true : userMuted;
+  vMain.muted = vAux.muted = SND ? true : (userMuted || trackMuted());
   snd.muted = userMuted;
 }
 function setVolume(x){ vMain.volume = vAux.volume = snd.volume = x; }
@@ -1544,6 +1575,7 @@ function setSoundtrack(j){
   try { snd.load(); } catch (e) {}
   applyMute();
   renderSoundtrack();
+  renderTracks();          /* a soundtrack takes the rows' mute buttons out of play */
   syncPlayButtons();
   sndSync(true);
   scheduleAutosave();
@@ -1555,6 +1587,7 @@ function clearSoundtrack(){
   try { snd.load(); } catch (e) {}
   applyMute();
   renderSoundtrack();
+  renderTracks();          /* a soundtrack takes the rows' mute buttons out of play */
   syncPlayButtons();
   scheduleAutosave();
 }
@@ -1672,7 +1705,7 @@ function sessionData(){
     tracks: TR.map(function(t){
       return { path: t.path, name: t.name, cuts: t.cuts.slice(),
                dels: t.dels.map(function(r){ return r.slice(); }),
-               loops: t.loops || 1, pong: !!t.pong };
+               loops: t.loops || 1, pong: !!t.pong, mute: !!t.mute };
     })
   };
 }
@@ -1714,6 +1747,7 @@ function applySession(s, files, audio){
     normTrackDels(TR.length - 1);
     t.loops = clamp(Math.round(+tr[k].loops) || 1, 1, 10);
     t.pong  = !!tr[k].pong;
+    t.mute  = !!tr[k].mute;
   }
   if (!TR.length){
     toast("None of that session's videos could be found" +
@@ -1812,6 +1846,13 @@ function restoreAutosave(){
       if (!j || !j.ok){ toast((j && j.error) || "The last session could not be restored.", "bad"); return; }
       applySession(JSON.parse(j.raw), j.files, j.audio);
     }, function(e){ toast("Could not reach the local server: " + e.message, "bad"); });
+}
+
+function setMute(i, on){
+  if (i < 0 || i >= TR.length || !!TR[i].mute === !!on) return;
+  snapshot();
+  TR[i].mute = !!on;
+  renderTracks(); render();
 }
 
 function setPong(i, on){
@@ -2202,6 +2243,7 @@ function doUndo(){
     h.edits[i].o.dels = h.edits[i].dels;
     h.edits[i].o.loops = h.edits[i].loops;
     h.edits[i].o.pong = h.edits[i].pong;
+    h.edits[i].o.mute = h.edits[i].mute;
   }
   selSeg = h.sel;
   if (h.ab){ A = h.A; B = h.B; }
@@ -3953,7 +3995,9 @@ try {
                     if (($e0 - $s0) -lt 0.01) { continue }
                     # r marks a ping-pong pass that plays this part backwards
                     $rv = ([string]$sg.r) -in @('1', 'True', 'true')
-                    [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0; r = $rv })
+                    # m marks a part whose track is muted - it goes out silent
+                    $mu = ([string]$sg.m) -in @('1', 'True', 'true')
+                    [void]$segs.Add(@{ tok = [string]$sg.t; info = $ti; s = $s0; e = $e0; r = $rv; m = $mu })
                 }
             }
             if ($segs.Count -eq 0) { Send-Json @{ ok = $false; error = 'Nothing is selected to save.' }; break }
@@ -3966,10 +4010,11 @@ try {
                 # set: one that overlaps or rewinds still contributes its own
                 # length, and folding it into its neighbour would silently drop it.
                 if ($prev -and $prev.tok -eq $sg.tok -and
-                    [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e -and -not $prev.r -and -not $sg.r) {
+                    [math]::Abs($sg.s - $prev.e) -le 0.0005 -and $sg.e -gt $prev.e -and -not $prev.r -and -not $sg.r -and
+                    $prev.m -eq $sg.m) {
                     $prev.e = $sg.e
                 } else {
-                    [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e; r = $sg.r })
+                    [void]$merged.Add(@{ tok = $sg.tok; info = $sg.info; s = $sg.s; e = $sg.e; r = $sg.r; m = $sg.m })
                 }
             }
             $segs = @($merged)
@@ -4071,7 +4116,9 @@ try {
                 # A soundtrack is looped from its own start and cut off by -t with the
                 # picture, and it is the only sound mapped - the clip's is dropped.
                 $sndIn  = $(if ($snd) { @('-stream_loop', '-1', '-i', $snd.path) } else { @() })
-                $sndMap = $(if ($snd) { @('-map', '1:a:0') } else { @('-map', '0:a:0?') })
+                $sndMap = $(if ($snd) { @('-map', '1:a:0') }
+                            elseif ($segs[0].m) { @('-an') }
+                            else { @('-map', '0:a:0?') })
                 $ffArgs = @(
                     '-y', '-hide_banner', '-nostats',
                     '-progress', $prog,
@@ -4116,7 +4163,7 @@ try {
                 # Each silent part gets its own lavfi input - a filter input pad
                 # cannot be consumed twice.
                 $anyAudio = $false
-                foreach ($sg in $segs) { if ($sg.info.hasAudio) { $anyAudio = $true } }
+                foreach ($sg in $segs) { if ($sg.info.hasAudio -and -not $sg.m) { $anyAudio = $true } }
                 # the soundtrack stands in for every part's sound, so the graph is picture only
                 if ($snd) { $anyAudio = $false }
 
@@ -4139,7 +4186,7 @@ try {
                     [void]$sb.Append("[${ix}:v]trim=start=${s0}:end=${e0},setpts=PTS-STARTPTS$(if ($sg.r) { ',reverse' })${vfit}[v$i];`n")
                     $chain += "[v$i]"
                     if ($anyAudio) {
-                        if ($sg.info.hasAudio) {
+                        if ($sg.info.hasAudio -and -not $sg.m) {
                             [void]$sb.Append("[${ix}:a]atrim=start=${s0}:end=${e0},asetpts=PTS-STARTPTS$(if ($sg.r) { ',areverse' })${afit}[a$i];`n")
                         } else {
                             $len = Num ($sg.e - $sg.s) '0.###'

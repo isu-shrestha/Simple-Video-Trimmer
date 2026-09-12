@@ -1344,6 +1344,112 @@ test("a soundtrack is saved with the session and comes back with it", function (
 });
 
 say("");
+say("--- per-track mute ---");
+
+/* the row's controls: [meta, jump, mute, clone, remove] */
+function muteBtn(k) {
+  var row = FAKE.el("tkList").childNodes[k];
+  return row.childNodes[row.childNodes.length - 2].childNodes[2];
+}
+
+test("only a muted track's parts are marked, and only when something is muted", function () {
+  reset(); addTracks([10, "T1"], [5, "T2"]);
+  eqJson(keptParts(), [{ t: "T1", s: 0, e: 10 }, { t: "T2", s: 0, e: 5 }]);
+  setMute(1, true);
+  eqJson(keptParts(), [{ t: "T1", s: 0, e: 10 }, { t: "T2", s: 0, e: 5, m: 1 }]);
+});
+
+test("every pass of a muted loop is marked, backwards ones included", function () {
+  reset(); addTracks([10, "T1"]);
+  PH = 4; doSplit(); pickAndDelete(7);          // keeps [0,4]
+  setMute(0, true); setPong(0, true); setLoops(0, 2);
+  var pass = [{ t: "T1", s: 0, e: 4, m: 1 }, { t: "T1", s: 0, e: 4, r: 1, m: 1 }];
+  eqJson(keptParts(), pass.concat(pass));
+});
+
+test("the row's mute button toggles the track and comes back lit", function () {
+  reset(); addTracks([10, "T1"]);
+  var b = muteBtn(0);
+  eq(b.className, "mute");
+  eq(b.disabled, false);
+  b.onclick();
+  eq(TR[0].mute, true);
+  eq(muteBtn(0).className, "mute on", "the redrawn button shows it is muted");
+  muteBtn(0).onclick();
+  eq(TR[0].mute, false);
+});
+
+test("muting is undoable", function () {
+  reset(); addTracks([10, "T1"], [5, "T2"]);
+  setMute(0, true); setMute(1, true);
+  doUndo(); eq(TR[1].mute, false); eq(TR[0].mute, true);
+  doUndo(); eq(TR[0].mute, false);
+});
+
+test("a muted track is silent while it is the one showing", function () {
+  reset(); addTracks([10, "T1"], [5, "T2"]);
+  setMute(0, true);
+  eq(cur, 0); eq(vMain.muted, true, "track 1 is muted, so the player is");
+  activate(1, 0, false);
+  eq(vMain.muted, false, "track 2 is not muted");
+  activate(0, 0, false);
+  eq(vMain.muted, true);
+});
+
+test("the volume bar's mute and a track's mute do not undo each other", function () {
+  reset(); addTracks([10, "T1"]);
+  setMute(0, true);
+  FAKE.el("bMute").onclick();                   // volume mute on
+  eq(userMuted, true); eq(vMain.muted, true);
+  FAKE.el("vol").oninput({ target: { value: "0.5" } });
+  eq(userMuted, false, "moving the slider clears the volume mute");
+  eq(vMain.muted, true, "but the track is still muted on its own account");
+  setMute(0, false);
+  eq(vMain.muted, false);
+});
+
+test("a track with no sound of its own has the button disabled", function () {
+  reset();
+  acceptTrack(mkTrack(10, { token: "Q", hasAudio: false }));
+  metaLanded();
+  var b = muteBtn(0);
+  eq(b.disabled, true);
+  eq(b.className, "mute", "disabled, not lit");
+  eq(vMain.muted, false, "nothing to mute, so nothing is muted");
+});
+
+test("a soundtrack takes the mute buttons out of play, and gives them back", function () {
+  reset(); addTracks([10, "T1"]);
+  setMute(0, true);
+  setSoundtrack(sndJ(3));
+  eq(muteBtn(0).disabled, true, "the soundtrack has replaced the track's sound");
+  eq(muteBtn(0).className, "mute", "so the button does not claim to be doing anything");
+  clearSoundtrack();
+  eq(muteBtn(0).disabled, false);
+  eq(muteBtn(0).className, "mute on", "the track's own mute was remembered");
+  eq(vMain.muted, true);
+});
+
+test("mute is saved with the session and comes back with it", function () {
+  reset(); addTracks([10, "T1"], [5, "T2"]);
+  TR[0].path = "C:\v\a.mp4"; TR[1].path = "C:\v\b.mp4";
+  setMute(1, true);
+  var s = JSON.parse(JSON.stringify(sessionData()));
+  eq(s.tracks[0].mute, false); eq(s.tracks[1].mute, true);
+  applySession(s, [mkTrack(10, { token: "N0" }), mkTrack(5, { token: "N1" })], null);
+  eq(TR[0].mute, false); eq(TR[1].mute, true);
+});
+
+test("a clone of a muted track is muted too", function () {
+  reset(); addTracks([10, "T1"]);
+  setMute(0, true);
+  insertClone(0, "C1");
+  eq(TR.length, 2);
+  eq(TR[1].mute, true);
+  eqJson(keptParts(), [{ t: "T1", s: 0, e: 10, m: 1 }, { t: "C1", s: 0, e: 10, m: 1 }]);
+});
+
+say("");
 say("--- the track list keeps its place ---");
 
 /* the shim's focus() does nothing; make it behave like a browser for a moment */

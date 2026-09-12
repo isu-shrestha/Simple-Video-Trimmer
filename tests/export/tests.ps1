@@ -148,12 +148,18 @@ Test-Case '[MIRROR] the load-bearing lines lib.ps1 copies are still present' {
         'Quote-Arg',
         # ping-pong: reversed parts never merge, and reverse both streams
         '-and -not $prev.r -and -not $sg.r',
+        # per-track mute: a marked part is silent, and never merges with an
+        # unmarked neighbour that happens to touch it end to end
+        "`$mu = ([string]`$sg.m) -in @('1', 'True', 'true')",
+        '$prev.m -eq $sg.m',
+        'if ($sg.info.hasAudio -and -not $sg.m) { $anyAudio = $true }',
+        'elseif ($segs[0].m) { @(''-an'') }',
         "PTS-STARTPTS`$(if (`$sg.r) { ',reverse' })",
         "PTS-STARTPTS`$(if (`$sg.r) { ',areverse' })",
         # soundtrack: looped in, the parts' own sound left out of the graph
         "@('-stream_loop', '-1', '-i', `$snd.path)",
         'if ($snd) { $anyAudio = $false }',
-        "`$sndMap = `$(if (`$snd) { @('-map', '1:a:0') } else { @('-map', '0:a:0?') })"
+        "`$sndMap = `$(if (`$snd) { @('-map', '1:a:0') }"
     )
     $missing = @($need | Where-Object { $txt.IndexOf($_) -lt 0 })
     Assert-Eq $missing.Count 0 ("the app changed but tests\export\lib.ps1 was not updated; missing: " +
@@ -483,6 +489,51 @@ Test-Case '[PLAN] an all-silent multi-part export maps no audio at all' {
     Remove-Item -LiteralPath $plan.filt -Force -ErrorAction SilentlyContinue
 }
 
+Test-Case '[PLAN] a muted part is silence, exactly like a soundless clip' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 1 },
+                               @{ t = $TOK.A; s = 3; e = 4; m = 1 })
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'planm1.mp4')
+    $line = $plan.ffArgs -join ' '
+    Assert-Eq ([regex]::Matches($line, 'anullsrc')).Count 1 'one silence input for the muted part'
+    Assert-True ($plan.filterText -match '\[0:a\]atrim=start=0') 'the unmuted part keeps its own sound'
+    Assert-True ($plan.filterText -notmatch '\[0:a\]atrim=start=3') 'the muted one does not'
+    Assert-True ($plan.filterText -match 'concat=n=2:v=1:a=1') 'audio still survives the concat'
+    Remove-Item -LiteralPath $plan.filt -Force -ErrorAction SilentlyContinue
+}
+
+Test-Case '[PLAN] muting every part maps no audio at all' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 1; m = 1 },
+                               @{ t = $TOK.A; s = 3; e = 4; m = 1 })
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'planm2.mp4')
+    Assert-True ($plan.filterText -match 'concat=n=2:v=1:a=0') 'video-only concat'
+    Assert-True (($plan.ffArgs -join ' ') -match '-an') 'and -an on the output'
+    Assert-True (($plan.ffArgs -join ' ') -notmatch 'anullsrc') 'no pointless silence inputs'
+    Remove-Item -LiteralPath $plan.filt -Force -ErrorAction SilentlyContinue
+}
+
+Test-Case '[PLAN] a single muted part takes the fast path with -an' {
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3; m = 1 })
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'planm3.mp4')
+    Assert-Eq $plan.kind 'fast' 'still the cheap path'
+    $line = $plan.ffArgs -join ' '
+    Assert-True ($line -match '-an') 'the clip its own sound is dropped'
+    Assert-True ($line -notmatch '0:a:0') 'and not mapped in as well'
+}
+
+Test-Case '[PLAN] a muted part never merges into the neighbour it touches' {
+    # Contiguous parts from one clip normally fold into a single encode. Folding
+    # a muted part into an audible one would hand back sound the user muted.
+    $r = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 2 },
+                               @{ t = $TOK.A; s = 2; e = 4; m = 1 })
+    Assert-Eq $r.segs.Count 2 'the join must survive the merge pass'
+    Assert-Eq $r.segs[0].m $false
+    Assert-Eq $r.segs[1].m $true
+    # two muted halves of the same run still merge - they agree
+    $r2 = Resolve-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 2; m = 1 },
+                                @{ t = $TOK.A; s = 2; e = 4; m = 1 })
+    Assert-Eq $r2.segs.Count 1 'parts that agree on mute still merge'
+}
+
 Test-Case '[PLAN] the concat branch is never reached with a single part' {
     # concat=n=1 is degenerate; the count check must always divert to the fast
     # path first, including when the single part comes from track 2.
@@ -681,6 +732,38 @@ Test-Case '[EXP] audio stays aligned with the picture across joins' {
         $q = Resolve-FixturePixel (Get-FixturePixel $out $pair[0])
         Assert-Eq $q.Family $pair[1] "picture at $($pair[0])s"
     }
+}
+
+Test-Case '[PLAN] a soundtrack outranks a muted part' {
+    # The soundtrack replaces every part's sound, so muting a track must not
+    # punch a silent hole in music that plays over the whole program.
+    $r = Resolve-SvtSegments -S $St -Payload (New-Payload @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3; m = 1 }) $null $SndToneTok)
+    Assert-True $r.ok "resolution failed: $($r.error)"
+    $plan = New-SvtExportPlan -S $St -Resolved $r -OutPath (Out-Path 'planm4.mp4')
+    $line = $plan.ffArgs -join ' '
+    Assert-True ($line -match '1:a:0') 'the soundtrack is mapped'
+    Assert-True ($line -notmatch '-an') 'and the output is not silenced'
+}
+
+Test-Case '[EXP] a muted track goes out silent while the others are heard' {
+    # A has sound of its own throughout. Mute its second part only: the picture
+    # must be unbroken, the first half audible and the second half real silence.
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 0; e = 2 },
+                                @{ t = $TOK.A; s = 3; e = 5; m = 1 }) 'muted.mp4'
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $out = Out-Path 'muted.mp4'
+    Assert-Eq (Get-StreamInfo $out).HasAudio $true 'the file still has an audio track'
+    Assert-Near (Get-VideoDuration $out) 4.0 0.25 'total duration'
+    Assert-True ((Get-MeanVolumeDb $out 0.2 1.6) -gt -40) 'the unmuted part is audible'
+    Assert-True ((Get-MeanVolumeDb $out 2.3 1.5) -lt -80) 'the muted part is digital silence'
+}
+
+Test-Case '[EXP] muting the only track produces a video-only file' {
+    $res = Export-P @($TOK.A) @(@{ t = $TOK.A; s = 1; e = 3; m = 1 }) 'mutedfast.mp4'
+    Assert-Eq $res.state 'done' "export failed: $($res.error)"
+    $si = Get-StreamInfo (Out-Path 'mutedfast.mp4')
+    Assert-Eq $si.HasAudio $false 'no audio stream at all'
+    Assert-Near $si.Duration 2.0 0.15 'and the picture is all there'
 }
 
 Test-Case '[EXP] an all-silent stitch produces a video-only file' {
